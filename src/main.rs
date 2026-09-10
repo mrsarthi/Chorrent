@@ -1,6 +1,3 @@
-#[path = "stage1/hashing_chunks.rs"]
-mod hashing_chunks;
-
 use anyhow::{Context, Result};
 use std::env;
 use std::fs;
@@ -13,7 +10,7 @@ fn main() -> Result<()> {
         .unwrap_or_else(|| PathBuf::from("movie.mp4"));
 
     println!("Hashing {}...", path.display());
-    let result = hashing_chunks::hash_file(&path)?;
+    let result = chorrent::stage1::chunker::hash_file(&path)?;
 
     println!("Root hash: {}", result.root_hash.to_hex());
 

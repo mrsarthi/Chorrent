@@ -1,7 +1,7 @@
-use anyhow::{Context, Result};
+use crate::error::ChunkerError;
 use bao_tree::io::outboard::PreOrderOutboard;
 use bao_tree::io::sync::CreateOutboard;
-use bao_tree::{BlockSize, blake3};
+use bao_tree::{blake3, BlockSize};
 use blake3::Hash;
 use std::fs::File;
 use std::path::Path;
@@ -13,16 +13,19 @@ pub struct HashResult {
     pub outboard: PreOrderOutboard<Vec<u8>>,
 }
 
-pub fn hash_file(path: &Path) -> Result<HashResult> {
-    let file = File::open(path)
-        .with_context(|| format!("failed to open {}", path.display()))?;
+pub fn hash_file(path: &Path) -> Result<HashResult, ChunkerError> {
+    let file = File::open(path).map_err(|source| ChunkerError::Open {
+        path: path.to_path_buf(),
+        source,
+    })?;
 
     let outboard = PreOrderOutboard::<Vec<u8>>::create(file, BLOCK_SIZE)
-        .with_context(|| format!("failed to hash {}", path.display()))?;
+        .map_err(|source| ChunkerError::Hash {
+            path: path.to_path_buf(),
+            source,
+        })?;
 
-    let root_hash = outboard.root;
-
-    Ok(HashResult { root_hash, outboard })
+    Ok(HashResult { root_hash: outboard.root, outboard })
 }
 
 #[cfg(test)]
@@ -37,9 +40,9 @@ mod tests {
         let mut tmp2 = tempfile::NamedTempFile::new().unwrap();
         tmp2.write_all(b"hello world").unwrap();
 
-        let r1 = hash_file(tmp1.path()).unwrap();
-        let r2 = hash_file(tmp2.path()).unwrap();
-
-        assert_eq!(r1.root_hash, r2.root_hash);
+        assert_eq!(
+            hash_file(tmp1.path()).unwrap().root_hash,
+            hash_file(tmp2.path()).unwrap().root_hash
+        );
     }
 }
