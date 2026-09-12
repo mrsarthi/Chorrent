@@ -16,3 +16,15 @@ pub enum ChunkerError {
         source: std::io::Error,
     },
 }
+
+#[derive(Debug, Error)]
+pub enum NodeError {
+    #[error("failed to bind endpoint: {message}")]
+    Bind { message: String },
+
+    #[error("failed to connect to peer: {message}")]
+    Connect { message: String },
+
+    #[error("failed to accept incoming connection: {message}")]
+    Accept { message: String },
+}

@@ -15,8 +15,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         send.write_all(b"Hello Node A, handshake confirmed!").await.unwrap();
         send.finish().unwrap();
-
-        conn.closed().await; 
     });
 
     let conn = node_a.connect(addr_b).await?;
@@ -27,8 +25,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let reply = recv.read_to_end(1000).await?;
     println!("Node A received reply: {}", String::from_utf8_lossy(&reply));
-
-    conn.close(0u32.into(), b"done");
 
     handle.await.unwrap();
     Ok(())
