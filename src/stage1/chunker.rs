@@ -7,6 +7,9 @@ use std::fs::File;
 use std::path::Path;
 
 pub const BLOCK_SIZE: BlockSize = BlockSize::from_chunk_log(4);
+// This defines the math for tree geometry. 
+// 4 here means 2^4 = 16 and these are each 1024 bytes
+// They are grouped into a single tree node, creating 16kib blocks 
 
 pub struct HashResult {
     pub root_hash: Hash,
