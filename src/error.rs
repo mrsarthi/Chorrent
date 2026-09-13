@@ -4,17 +4,16 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 pub enum ChunkerError {
     #[error("failed to open {path}: {source}")]
-    Open {
-        path: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
+    Open { path: PathBuf, #[source] source: std::io::Error },
+
     #[error("failed to hash {path}: {source}")]
-    Hash {
-        path: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
+    Hash { path: PathBuf, #[source] source: std::io::Error },
+
+    #[error("failed to extract a piece from {path}: {source}")]
+    Serve { path: PathBuf, #[source] source: std::io::Error },
+
+    #[error("failed to verify/save an incoming piece to {path}: {source}")]
+    Receive { path: PathBuf, #[source] source: std::io::Error },
 }
 
 #[derive(Debug, Error)]
