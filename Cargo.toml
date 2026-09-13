@@ -9,6 +9,8 @@ tokio = {version = "1", features = ["full"]}
 bao-tree = "0.16"
 anyhow = "1"
 thiserror = "2.0.20"
+iroh-tickets = "1"
+blake3 = "1"
 
 [dev-dependencies]
 tempfile = "3"
