@@ -27,3 +27,12 @@ pub enum NodeError {
     #[error("failed to accept incoming connection: {message}")]
     Accept { message: String },
 }
+
+#[derive(Debug, Error)]
+pub enum ProtocolError {
+    #[error("failed to send protocol message: {message}")]
+    Send { message: String },
+
+    #[error("failed to receive protocol message: {message}")]
+    Receive { message: String },
+}

@@ -1,5 +1,6 @@
 use chorrent::stage1::chunker;
 use chorrent::stage2::node::ChorrentNode;
+use chorrent::stage3::protocol;
 use iroh_tickets::endpoint::EndpointTicket;
 use std::env;
 use std::path::PathBuf;
@@ -21,23 +22,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let end = std::cmp::min(start + chunk_size, total_size);
 
         let (mut send, mut recv) = conn.open_bi().await?;
-        let mut request = Vec::with_capacity(16);
-        request.extend_from_slice(&start.to_le_bytes());
-        request.extend_from_slice(&end.to_le_bytes());
-        send.write_all(&request).await?;
-        send.finish()?;
+        protocol::send_request(&mut send, &protocol::PieceRequest { start, end }).await?;
 
-        let encoded = recv.read_to_end(10_000_000).await?;
+        let encoded = protocol::receive_response(&mut recv).await?;
         chunker::receive_range(&output, root_hash, total_size, start, end, &encoded)?;
         println!("Verified and saved bytes {}..{}", start, end);
 
         start = end;
     }
 
-    conn.close(0u32.into(), b"done"); // we're the final receiver — close now
+    conn.close(0u32.into(), b"done");
 
-    // One last, whole-file sanity check, on top of every piece already
-    // having been verified individually.
     let verify = chunker::hash_file(&output)?;
     assert_eq!(verify.root_hash, root_hash, "final file does not match expected root hash!");
     println!("Full file transferred and verified successfully.");

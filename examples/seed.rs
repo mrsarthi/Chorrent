@@ -1,5 +1,6 @@
 use chorrent::stage1::chunker;
 use chorrent::stage2::node::ChorrentNode;
+use chorrent::stage3::protocol;
 use iroh_tickets::{endpoint::EndpointTicket, Ticket};
 use std::env;
 use std::path::PathBuf;
@@ -25,17 +26,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         loop {
             let (mut send, mut recv) = match conn.accept_bi().await {
                 Ok(streams) => streams,
-                Err(_) => break, // this peer disconnected
+                Err(_) => break,
             };
 
-            let request = recv.read_to_end(16).await?;
-            let start = u64::from_le_bytes(request[0..8].try_into()?);
-            let end = u64::from_le_bytes(request[8..16].try_into()?);
-            println!("Serving bytes {}..{}", start, end);
+            let request = protocol::receive_request(&mut recv).await?;
+            println!("Serving bytes {}..{}", request.start, request.end);
 
-            let encoded = chunker::serve_range(&path, &hashed.outboard, start, end)?;
-            send.write_all(&encoded).await?;
-            send.finish()?;
+            let encoded = chunker::serve_range(&path, &hashed.outboard, request.start, request.end)?;
+            protocol::send_response(&mut send, &encoded).await?;
         }
 
         println!("Peer disconnected. Waiting for the next one...");
