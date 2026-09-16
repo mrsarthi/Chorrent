@@ -1,6 +1,6 @@
 use chorrent::stage1::chunker;
 use chorrent::stage2::node::ChorrentNode;
-use chorrent::stage3::protocol;
+use chorrent::stage3::protocol::{self, PieceRequest};
 use iroh_tickets::endpoint::EndpointTicket;
 use std::env;
 use std::path::PathBuf;
@@ -22,9 +22,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let end = std::cmp::min(start + chunk_size, total_size);
 
         let (mut send, mut recv) = conn.open_bi().await?;
-        protocol::send_request(&mut send, &protocol::PieceRequest { start, end }).await?;
+        protocol::send_piece_request(&mut send, &PieceRequest { start, end }).await?;
 
-        let encoded = protocol::receive_response(&mut recv).await?;
+        let response = protocol::receive_piece_response(&mut recv).await?;
+        let encoded = response.expect("seeder should have every piece in this simple test");
         chunker::receive_range(&output, root_hash, total_size, start, end, &encoded)?;
         println!("Verified and saved bytes {}..{}", start, end);
 

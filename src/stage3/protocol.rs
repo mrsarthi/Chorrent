@@ -1,7 +1,6 @@
 use crate::error::ProtocolError;
 use iroh::endpoint::{RecvStream, SendStream};
 
-/// A request for one piece of a file: "give me bytes start..end".
 pub struct PieceRequest {
     pub start: u64,
     pub end: u64,
@@ -22,31 +21,85 @@ impl PieceRequest {
     }
 }
 
-/// Ask a peer for one piece, over a stream you've already opened.
-pub async fn send_request(send: &mut SendStream, request: &PieceRequest) -> Result<(), ProtocolError> {
-    send.write_all(&request.to_bytes()).await
+/// Everything a peer might ask us for, over one stream.
+pub enum IncomingMessage {
+    BitfieldRequest,
+    PieceRequest(PieceRequest),
+}
+
+// ---- Asking (leecher side) ----
+
+pub async fn request_bitfield(send: &mut SendStream) -> Result<(), ProtocolError> {
+    send.write_all(&[0u8]).await
         .map_err(|e| ProtocolError::Send { message: e.to_string() })?;
     send.finish().map_err(|e| ProtocolError::Send { message: e.to_string() })?;
     Ok(())
 }
 
-/// Read an incoming piece request, on a stream you've already accepted.
-pub async fn receive_request(recv: &mut RecvStream) -> Result<PieceRequest, ProtocolError> {
-    let bytes = recv.read_to_end(16).await
+pub async fn send_piece_request(send: &mut SendStream, request: &PieceRequest) -> Result<(), ProtocolError> {
+    let mut bytes = vec![1u8];
+    bytes.extend_from_slice(&request.to_bytes());
+    send.write_all(&bytes).await
+        .map_err(|e| ProtocolError::Send { message: e.to_string() })?;
+    send.finish().map_err(|e| ProtocolError::Send { message: e.to_string() })?;
+    Ok(())
+}
+
+// ---- Reading a question (peer side) ----
+
+pub async fn receive_message(recv: &mut RecvStream) -> Result<IncomingMessage, ProtocolError> {
+    let bytes = recv.read_to_end(17).await
         .map_err(|e| ProtocolError::Receive { message: e.to_string() })?;
-    Ok(PieceRequest::from_bytes(&bytes))
+
+    match bytes.first() {
+        Some(0) => Ok(IncomingMessage::BitfieldRequest),
+        Some(1) => Ok(IncomingMessage::PieceRequest(PieceRequest::from_bytes(&bytes[1..]))),
+        _ => Err(ProtocolError::Receive { message: "unrecognized message tag".to_string() }),
+    }
 }
 
-/// Send back a piece's data (already produced by `chunker::serve_range`).
-pub async fn send_response(send: &mut SendStream, encoded: &[u8]) -> Result<(), ProtocolError> {
-    send.write_all(encoded).await
+// ---- Answering (peer side) ----
+
+pub async fn send_bitfield(send: &mut SendStream, have: &[bool]) -> Result<(), ProtocolError> {
+    let bytes: Vec<u8> = have.iter().map(|&b| b as u8).collect();
+    send.write_all(&bytes).await
         .map_err(|e| ProtocolError::Send { message: e.to_string() })?;
     send.finish().map_err(|e| ProtocolError::Send { message: e.to_string() })?;
     Ok(())
 }
 
-/// Read an incoming piece response.
-pub async fn receive_response(recv: &mut RecvStream) -> Result<Vec<u8>, ProtocolError> {
-    recv.read_to_end(10_000_000).await
-        .map_err(|e| ProtocolError::Receive { message: e.to_string() })
+/// `None` means "I don't have that piece."
+pub async fn send_piece_response(send: &mut SendStream, encoded: Option<&[u8]>) -> Result<(), ProtocolError> {
+    let bytes = match encoded {
+        Some(data) => {
+            let mut b = vec![1u8];
+            b.extend_from_slice(data);
+            b
+        }
+        None => vec![0u8],
+    };
+    send.write_all(&bytes).await
+        .map_err(|e| ProtocolError::Send { message: e.to_string() })?;
+    send.finish().map_err(|e| ProtocolError::Send { message: e.to_string() })?;
+    Ok(())
+}
+
+// ---- Reading an answer (leecher side) ----
+
+pub async fn receive_bitfield(recv: &mut RecvStream, total_pieces: usize) -> Result<Vec<bool>, ProtocolError> {
+    let bytes = recv.read_to_end(total_pieces).await
+        .map_err(|e| ProtocolError::Receive { message: e.to_string() })?;
+    Ok(bytes.iter().map(|&b| b == 1).collect())
+}
+
+/// `None` means the peer told us they don't have that piece.
+pub async fn receive_piece_response(recv: &mut RecvStream) -> Result<Option<Vec<u8>>, ProtocolError> {
+    let bytes = recv.read_to_end(10_000_000).await
+        .map_err(|e| ProtocolError::Receive { message: e.to_string() })?;
+
+    match bytes.first() {
+        Some(0) => Ok(None),
+        Some(1) => Ok(Some(bytes[1..].to_vec())),
+        _ => Err(ProtocolError::Receive { message: "unrecognized response tag".to_string() }),
+    }
 }

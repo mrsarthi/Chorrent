@@ -14,3 +14,8 @@ pub mod stage3 {
     #[path = "protocol.rs"]
     pub mod protocol;
 }
+
+pub mod stage4 {
+    #[path = "scheduler.rs"]
+    pub mod scheduler;
+}
