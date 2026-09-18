@@ -21,3 +21,8 @@ pub mod stage4 {
     #[path = "scheduler.rs"]
     pub mod scheduler;
 }
+
+pub mod stage5 {
+    #[path = "discovery.rs"]
+    pub mod discovery;
+}

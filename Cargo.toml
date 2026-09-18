@@ -12,6 +12,11 @@ thiserror = "2.0.20"
 iroh-tickets = "1"
 blake3 = "1"
 iroh-gossip = "0.101.0"
+serde = { version = "1.0.229", features = ["derive"] }
+postcard = "1.1.3"
+futures-lite = "2.6.1"
+n0-future = "0.3.2"
+clap = { version = "4.6.7", features = ["derive"] }
 
 [dev-dependencies]
 tempfile = "3"

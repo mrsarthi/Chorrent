@@ -5,6 +5,9 @@ use iroh_tickets::{endpoint::EndpointTicket, Ticket};
 use std::collections::HashSet;
 use std::env;
 use std::path::PathBuf;
+use chorrent::stage5::discovery;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -32,7 +35,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         path: path.clone(),
         root_hash: hashed.root_hash,
         outboard: hashed.outboard,
-        held,
+        held: held.clone(),
         total_pieces,
     };
 
@@ -41,6 +44,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Ticket: {}", ticket);
 
     println!("Ready and listening. Press Ctrl+C to stop.");
+    let topic_id = discovery::topic_for(&hashed.root_hash);
+    let bootstrap = match args.get(3) {
+        Some(ticket_str) => {
+            let boot_ticket: EndpointTicket = ticket_str.parse()?;
+            vec![boot_ticket.endpoint_addr().id]
+        }
+        None => vec![],
+    };
+    let (sender, receiver) = node.gossip().subscribe(topic_id, bootstrap).await?.split();
+
+    let known = Arc::new(Mutex::new(HashMap::new()));
+    tokio::spawn(discovery::listen_for_peers(receiver, known));
+
+    let have: Vec<bool> = (0..total_pieces).map(|i| held.contains(&i)).collect();
+    let announcement = discovery::Announcement { ticket: ticket.to_string(), bitfield: have };
+    tokio::spawn(discovery::announce_periodically(sender, announcement));
     tokio::signal::ctrl_c().await?;
 
     Ok(())

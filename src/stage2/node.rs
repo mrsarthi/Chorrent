@@ -1,5 +1,4 @@
 use crate::error::NodeError;
-use crate::stage3::handler::ChorrentProtocol;
 use iroh::endpoint::{presets, Connection};
 use iroh::protocol::Router;
 use iroh::{Endpoint, EndpointAddr};
