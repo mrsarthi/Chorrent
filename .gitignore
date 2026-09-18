@@ -1,6 +1,12 @@
 /.agents
 /target
 
+# Ignore large media files and generated output
+*.mp4
+*.MP4
+output.mp4
+ouptput.mp4
+
 skills-lock.json
 tesing.txt
 goal.txt
