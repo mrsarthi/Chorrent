@@ -1,24 +1,36 @@
 use crate::error::NodeError;
+use crate::stage3::handler::ChorrentProtocol;
 use iroh::endpoint::{presets, Connection};
+use iroh::protocol::Router;
 use iroh::{Endpoint, EndpointAddr};
+use iroh_gossip::Gossip;
+use std::sync::Arc;
 
 pub const ALPN: &[u8] = b"chorrent/0.1";
 
 pub struct ChorrentNode {
     endpoint: Endpoint,
-    // endpoint variable: of type Endpoint
+    gossip: Gossip,
+    _router: Router, // keeps the router's background accept loop alive
 }
 
-// The BEHAVIOR: what a ChorrentNode can do
 impl ChorrentNode {
-    pub async fn bind() -> Result<Self, NodeError> {
+    /// Bind a node that can dial out, and accepts incoming connections
+    /// for both our own protocol and gossip.
+    pub async fn bind<H: iroh::protocol::ProtocolHandler>(handler: H) -> Result<Self, NodeError> {
         let endpoint = Endpoint::builder(presets::N0)
-            .alpns(vec![ALPN.to_vec()])
             .bind()
             .await
             .map_err(|e| NodeError::Bind { message: e.to_string() })?;
 
-        Ok(Self { endpoint })
+        let gossip = Gossip::builder().spawn(endpoint.clone());
+
+        let router = Router::builder(endpoint.clone())
+            .accept(ALPN.to_vec(), Arc::new(handler))
+            .accept(iroh_gossip::ALPN, gossip.clone())
+            .spawn();
+
+        Ok(Self { endpoint, gossip, _router: router })
     }
 
     pub fn addr(&self) -> EndpointAddr {
@@ -32,15 +44,8 @@ impl ChorrentNode {
             .map_err(|e| NodeError::Connect { message: e.to_string() })
     }
 
-    pub async fn accept(&self) -> Result<Connection, NodeError> {
-        let incoming = self
-            .endpoint
-            .accept()
-            .await
-            .ok_or_else(|| NodeError::Accept { message: "endpoint closed".into() })?;
-
-        incoming
-            .await
-            .map_err(|e| NodeError::Accept { message: e.to_string() })
+    /// For the discovery step we're about to build next.
+    pub fn gossip(&self) -> &Gossip {
+        &self.gossip
     }
 }

@@ -13,6 +13,8 @@ pub mod stage2 {
 pub mod stage3 {
     #[path = "protocol.rs"]
     pub mod protocol;
+    #[path = "handler.rs"]
+    pub mod handler;
 }
 
 pub mod stage4 {

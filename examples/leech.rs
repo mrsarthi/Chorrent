@@ -4,6 +4,7 @@ use chorrent::stage3::protocol::{self, PieceRequest};
 use iroh_tickets::endpoint::EndpointTicket;
 use std::env;
 use std::path::PathBuf;
+use chorrent::stage3::handler::NullProtocol;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -13,7 +14,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let total_size: u64 = args[3].parse()?;
     let output = PathBuf::from(&args[4]);
 
-    let node = ChorrentNode::bind().await?;
+    let node = ChorrentNode::bind(NullProtocol).await?;
     let conn = node.connect(ticket.endpoint_addr().clone()).await?;
 
     let chunk_size = chunker::BLOCK_SIZE.bytes() as u64;

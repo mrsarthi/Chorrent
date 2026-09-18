@@ -11,6 +11,7 @@ anyhow = "1"
 thiserror = "2.0.20"
 iroh-tickets = "1"
 blake3 = "1"
+iroh-gossip = "0.101.0"
 
 [dev-dependencies]
 tempfile = "3"
