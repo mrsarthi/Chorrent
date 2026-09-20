@@ -10,7 +10,7 @@ pub const ALPN: &[u8] = b"chorrent/0.1";
 pub struct ChorrentNode {
     endpoint: Endpoint,
     gossip: Gossip,
-    _router: Router, // keeps the router's background accept loop alive
+    _router: Router,
 }
 
 impl ChorrentNode {
@@ -43,7 +43,6 @@ impl ChorrentNode {
             .map_err(|e| NodeError::Connect { message: e.to_string() })
     }
 
-    /// For the discovery step we're about to build next.
     pub fn gossip(&self) -> &Gossip {
         &self.gossip
     }

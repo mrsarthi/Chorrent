@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use rand::prelude::IndexedRandom;
 
 /// For now, just a plain identifier string for a peer (their ticket, or
 /// eventually their EndpointId). The scheduler doesn't need to know
@@ -18,11 +19,21 @@ impl SwarmState {
     /// fewer pieces overall — i.e. actually favor the scarcer peer,
     /// instead of picking arbitrarily.
     fn peer_with_piece(&self, piece: usize) -> Option<PeerId> {
-        self.peer_bitfields
+        let min_count = self
+            .peer_bitfields
             .iter()
             .filter(|(_, bits)| bits[piece])
-            .min_by_key(|(_, bits)| bits.iter().filter(|&&b| b).count())
-            .map(|(peer, _)| peer.clone())
+            .map(|(_, bits)| bits.iter().filter(|&&b| b).count())
+            .min()?;
+
+        let candidates: Vec<&PeerId> = self
+            .peer_bitfields
+            .iter()
+            .filter(|(_, bits)| bits[piece] && bits.iter().filter(|&&b| b).count() == min_count)
+            .map(|(peer, _)| peer)
+            .collect();
+
+        candidates.choose(&mut rand::rng()).map(|&p| p.clone())
     }
 
     fn peers_with_piece_count(&self, piece: usize) -> usize {
