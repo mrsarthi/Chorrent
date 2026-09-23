@@ -1,6 +1,7 @@
 # Chorrent (vers. 0.2.0)
 
-Chorrent is a Rust-based p2p file transfer engine, built on Iroh and QUIC streams to move files directly between peers — no central server required.
+Chorrent is a Rust-based p2p file transfer engine, built on Iroh and QUIC streams to move files directly between peers.
+No central server required.
 
 > **Now supports swarm as well**
 
@@ -15,7 +16,7 @@ Chorrent is a Rust-based p2p file transfer engine, built on Iroh and QUIC stream
 
 Share a file:
 ```bash
-chorrent seed <file>
+chorrent seed <file_path>
 ```
 Download a file using a share code from a seeder (share this):
 ```bash
