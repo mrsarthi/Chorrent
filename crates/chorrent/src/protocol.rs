@@ -89,7 +89,11 @@ pub async fn send_piece_response(send: &mut SendStream, encoded: Option<&[u8]>) 
 pub async fn receive_bitfield(recv: &mut RecvStream, total_pieces: usize) -> Result<Vec<bool>, ProtocolError> {
     let bytes = recv.read_to_end(total_pieces).await
         .map_err(|e| ProtocolError::Receive { message: e.to_string() })?;
-    Ok(bytes.iter().map(|&b| b == 1).collect())
+    // A peer that sends a short (or long) bitfield must not cause an
+    // out-of-bounds index later; missing entries mean "doesn't have it".
+    let mut have: Vec<bool> = bytes.iter().map(|&b| b == 1).collect();
+    have.resize(total_pieces, false);
+    Ok(have)
 }
 
 /// `None` means the peer told us they don't have that piece.

@@ -14,6 +14,11 @@ No central server required.
 
 ## Usage
 
+Install the CLI:
+```bash
+cargo install --path crates/chorrent-cli
+```
+
 Share a file:
 ```bash
 chorrent seed <file_path>
@@ -21,6 +26,29 @@ chorrent seed <file_path>
 Download a file using a share code from a seeder (share this):
 ```bash
 chorrent get <share_code>
+```
+
+Seed the same file from a second machine, joining the first seeder's swarm:
+```bash
+chorrent seed <file_path> --join <share_code>
+```
+
+## As a library
+
+The `chorrent` crate (`crates/chorrent`) is the engine; the CLI is a thin layer over it.
+
+```rust
+let client = chorrent::Client::new().await?;
+
+// Seed
+let seed = client.seed("movie.mp4").await?;
+println!("share this: {}", seed.share_code());
+
+// Download, watching progress events
+let code: chorrent::ShareCode = share_text.parse()?;
+let download = client.download(&code, None).await?;
+let mut events = download.events();
+let path = download.finished().await?; // verified against the root hash
 ```
 
 ## Status

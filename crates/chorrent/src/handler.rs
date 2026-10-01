@@ -1,24 +1,32 @@
-use crate::stage1::chunker;
-use crate::stage3::protocol::{self, IncomingMessage};
+use crate::chunker;
+use crate::event::Event;
+use crate::protocol::{self, IncomingMessage};
 use bao_tree::blake3::Hash;
 use bao_tree::io::outboard::PreOrderOutboard;
 use iroh::endpoint::Connection;
 use iroh::protocol::{AcceptError, ProtocolHandler};
-use std::collections::HashSet;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
+use tokio::sync::broadcast;
 
-#[derive(Debug, Clone)]
-pub struct ChorrentProtocol {
+/// A file this node is currently willing to hand out pieces of.
+#[derive(Debug)]
+pub(crate) struct ServedFile {
     pub path: PathBuf,
+    #[allow(dead_code)] // used once requests name the file they're for (protocol v2)
     pub root_hash: Hash,
     pub outboard: PreOrderOutboard<Vec<u8>>,
-    pub held: HashSet<usize>,
-    pub total_pieces: usize,
-    /// Running total of bytes served — shared with whoever's displaying
-    /// the live upload status outside this handler.
-    pub bytes_served: Arc<AtomicU64>,
+    pub held: Vec<bool>,
+    pub events: broadcast::Sender<Event>,
+}
+
+/// What the node is serving right now. Requests don't yet say which file
+/// they want, so a node can serve at most one file at a time.
+pub(crate) type ServingSlot = Arc<RwLock<Option<Arc<ServedFile>>>>;
+
+#[derive(Debug, Clone)]
+pub(crate) struct ChorrentProtocol {
+    pub serving: ServingSlot,
 }
 
 impl ProtocolHandler for ChorrentProtocol {
@@ -29,20 +37,23 @@ impl ProtocolHandler for ChorrentProtocol {
                 Err(_) => break,
             };
 
-            let have: Vec<bool> = (0..self.total_pieces).map(|i| self.held.contains(&i)).collect();
+            let Some(file) = self.serving.read().unwrap().clone() else {
+                connection.close(0u32.into(), b"not serving");
+                break;
+            };
 
             match protocol::receive_message(&mut recv).await {
                 Ok(IncomingMessage::BitfieldRequest) => {
-                    protocol::send_bitfield(&mut send, &have).await.ok();
+                    protocol::send_bitfield(&mut send, &file.held).await.ok();
                 }
                 Ok(IncomingMessage::PieceRequest(req)) => {
                     let chunk_size = chunker::BLOCK_SIZE.bytes() as u64;
                     let piece_index = (req.start / chunk_size) as usize;
 
-                    if self.held.contains(&piece_index) {
-                        match chunker::serve_range(&self.path, &self.outboard, req.start, req.end) {
+                    if file.held.get(piece_index).copied().unwrap_or(false) {
+                        match chunker::serve_range(&file.path, &file.outboard, req.start, req.end) {
                             Ok(encoded) => {
-                                self.bytes_served.fetch_add(encoded.len() as u64, Ordering::Relaxed);
+                                let _ = file.events.send(Event::Uploaded { bytes: encoded.len() as u64 });
                                 protocol::send_piece_response(&mut send, Some(&encoded)).await.ok();
                             }
                             Err(_) => { protocol::send_piece_response(&mut send, None).await.ok(); }
@@ -55,16 +66,6 @@ impl ProtocolHandler for ChorrentProtocol {
             }
         }
 
-        Ok(())
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct NullProtocol;
-
-impl ProtocolHandler for NullProtocol {
-    async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
-        connection.close(0u32.into(), b"not serving");
         Ok(())
     }
 }

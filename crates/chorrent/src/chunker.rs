@@ -61,6 +61,8 @@ pub fn receive_range(
     let mut dest = OpenOptions::new()
         .write(true)
         .create(true)
+        // Never truncate: other workers are writing their pieces into this same file.
+        .truncate(false)
         .open(dest_path)
         .map_err(|source| ChunkerError::Receive { path: dest_path.to_path_buf(), source })?;
 

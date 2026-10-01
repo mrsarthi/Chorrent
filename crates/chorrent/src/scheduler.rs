@@ -52,10 +52,10 @@ pub fn next_piece_to_request(
     // 1. Urgent zone: fill in order, earliest missing piece first.
     let window_end = (playhead + window).min(state.total_pieces);
     for piece in playhead..window_end {
-        if !state.have[piece] {
-            if let Some(peer) = state.peer_with_piece(piece) {
-                return Some((piece, peer));
-            }
+        if !state.have[piece]
+            && let Some(peer) = state.peer_with_piece(piece)
+        {
+            return Some((piece, peer));
         }
     }
 

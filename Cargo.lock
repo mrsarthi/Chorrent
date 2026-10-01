@@ -345,24 +345,31 @@ dependencies = [
 
 [[package]]
 name = "chorrent"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
- "anyhow",
  "bao-tree",
  "base64 0.23.1",
  "blake3",
- "clap",
  "futures-lite",
- "indicatif",
  "iroh",
  "iroh-gossip",
  "iroh-tickets",
- "n0-future",
  "postcard",
  "rand",
  "serde",
  "tempfile",
  "thiserror 2.0.20",
+ "tokio",
+]
+
+[[package]]
+name = "chorrent-cli"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "chorrent",
+ "clap",
+ "indicatif",
  "tokio",
 ]
 

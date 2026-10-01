@@ -5,12 +5,12 @@ use iroh::{Endpoint, EndpointAddr};
 use iroh_gossip::Gossip;
 use std::sync::Arc;
 
-pub const ALPN: &[u8] = b"chorrent/0.1";
+pub(crate) const ALPN: &[u8] = b"chorrent/0.1";
 
-pub struct ChorrentNode {
+pub(crate) struct ChorrentNode {
     endpoint: Endpoint,
     gossip: Gossip,
-    _router: Router,
+    router: Router,
 }
 
 impl ChorrentNode {
@@ -25,11 +25,11 @@ impl ChorrentNode {
         let gossip = Gossip::builder().spawn(endpoint.clone());
 
         let router = Router::builder(endpoint.clone())
-            .accept(ALPN.to_vec(), Arc::new(handler))
+            .accept(ALPN, Arc::new(handler))
             .accept(iroh_gossip::ALPN, gossip.clone())
             .spawn();
 
-        Ok(Self { endpoint, gossip, _router: router })
+        Ok(Self { endpoint, gossip, router })
     }
 
     pub fn addr(&self) -> EndpointAddr {
@@ -45,5 +45,10 @@ impl ChorrentNode {
 
     pub fn gossip(&self) -> &Gossip {
         &self.gossip
+    }
+
+    /// Stop accepting connections and close the endpoint.
+    pub async fn shutdown(&self) {
+        let _ = self.router.shutdown().await;
     }
 }

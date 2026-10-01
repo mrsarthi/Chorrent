@@ -1,5 +1,6 @@
 /.agents
 /target
+/.kilos
 
 # Ignore large media files and generated output
 *.mp4
