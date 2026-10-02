@@ -1,109 +1,98 @@
+//! Wire protocol v2.
+//!
+//! Every message is a frame: a little-endian u32 length followed by that
+//! many bytes of postcard. Each request opens a fresh bidirectional QUIC
+//! stream (cheap, and lets many requests run in parallel on one connection).
+//! Most requests get one response frame; `Subscribe` gets a bitfield and
+//! then a stream of `Have` frames as the peer verifies new pieces.
+
 use crate::error::ProtocolError;
+use crate::manifest::ShareId;
 use iroh::endpoint::{RecvStream, SendStream};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
-pub struct PieceRequest {
-    pub start: u64,
-    pub end: u64,
+/// The ALPN doubles as the protocol version: v1 and v2 nodes simply won't connect.
+pub(crate) const ALPN: &[u8] = b"chorrent/2";
+
+/// Big enough for a 64 KiB piece plus proof, or a large manifest.
+const MAX_FRAME: usize = 16 * 1024 * 1024;
+
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) enum Request {
+    Manifest { share: ShareId, auth: Option<[u8; 32]> },
+    Subscribe { share: ShareId, auth: Option<[u8; 32]> },
+    Piece { share: ShareId, auth: Option<[u8; 32]>, index: u32 },
 }
 
-impl PieceRequest {
-    fn to_bytes(&self) -> [u8; 16] {
-        let mut bytes = [0u8; 16];
-        bytes[0..8].copy_from_slice(&self.start.to_le_bytes());
-        bytes[8..16].copy_from_slice(&self.end.to_le_bytes());
-        bytes
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) enum Response {
+    Manifest(Vec<u8>),
+    /// One bit per piece, least significant bit first.
+    Bitfield(Vec<u8>),
+    Have(u32),
+    Piece(Vec<u8>),
+    DontHave,
+    /// Unknown share, or a private share and the auth token was wrong.
+    /// Deliberately the same answer, so private shares can't be probed.
+    NotFound,
+    /// Too many uploads in progress; try again later.
+    Busy,
+}
+
+pub(crate) async fn write_frame<T: Serialize>(send: &mut SendStream, msg: &T) -> Result<(), ProtocolError> {
+    let body = postcard::to_allocvec(msg).map_err(|e| ProtocolError::Send { message: e.to_string() })?;
+    let mut frame = Vec::with_capacity(4 + body.len());
+    frame.extend_from_slice(&(body.len() as u32).to_le_bytes());
+    frame.extend_from_slice(&body);
+    send.write_all(&frame).await.map_err(|e| ProtocolError::Send { message: e.to_string() })
+}
+
+/// `Ok(None)` means the stream ended cleanly between frames.
+pub(crate) async fn read_frame<T: DeserializeOwned>(recv: &mut RecvStream) -> Result<Option<T>, ProtocolError> {
+    let mut len = [0u8; 4];
+    match recv.read_exact(&mut len).await {
+        Ok(()) => {}
+        Err(iroh::endpoint::ReadExactError::FinishedEarly(0)) => return Ok(None),
+        Err(e) => return Err(ProtocolError::Receive { message: e.to_string() }),
     }
-
-    fn from_bytes(bytes: &[u8]) -> Self {
-        let start = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
-        let end = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
-        Self { start, end }
+    let len = u32::from_le_bytes(len) as usize;
+    if len > MAX_FRAME {
+        return Err(ProtocolError::Receive { message: format!("frame of {len} bytes is too large") });
     }
+    let mut body = vec![0u8; len];
+    recv.read_exact(&mut body).await.map_err(|e| ProtocolError::Receive { message: e.to_string() })?;
+    postcard::from_bytes(&body).map(Some).map_err(|e| ProtocolError::Receive { message: e.to_string() })
 }
 
-/// Everything a peer might ask us for, over one stream.
-pub enum IncomingMessage {
-    BitfieldRequest,
-    PieceRequest(PieceRequest),
+pub(crate) async fn expect_frame<T: DeserializeOwned>(recv: &mut RecvStream) -> Result<T, ProtocolError> {
+    read_frame(recv)
+        .await?
+        .ok_or_else(|| ProtocolError::Receive { message: "peer closed the stream".into() })
 }
 
-// ---- Asking (leecher side) ----
-
-pub async fn request_bitfield(send: &mut SendStream) -> Result<(), ProtocolError> {
-    send.write_all(&[0u8]).await
-        .map_err(|e| ProtocolError::Send { message: e.to_string() })?;
-    send.finish().map_err(|e| ProtocolError::Send { message: e.to_string() })?;
-    Ok(())
-}
-
-pub async fn send_piece_request(send: &mut SendStream, request: &PieceRequest) -> Result<(), ProtocolError> {
-    let mut bytes = vec![1u8];
-    bytes.extend_from_slice(&request.to_bytes());
-    send.write_all(&bytes).await
-        .map_err(|e| ProtocolError::Send { message: e.to_string() })?;
-    send.finish().map_err(|e| ProtocolError::Send { message: e.to_string() })?;
-    Ok(())
-}
-
-// ---- Reading a question (peer side) ----
-
-pub async fn receive_message(recv: &mut RecvStream) -> Result<IncomingMessage, ProtocolError> {
-    let bytes = recv.read_to_end(17).await
-        .map_err(|e| ProtocolError::Receive { message: e.to_string() })?;
-
-    match bytes.first() {
-        Some(0) => Ok(IncomingMessage::BitfieldRequest),
-        Some(1) => Ok(IncomingMessage::PieceRequest(PieceRequest::from_bytes(&bytes[1..]))),
-        _ => Err(ProtocolError::Receive { message: "unrecognized message tag".to_string() }),
+/// Pack a `have` list into bits, least significant bit first.
+pub(crate) fn pack_bits(have: &[bool]) -> Vec<u8> {
+    let mut out = vec![0u8; have.len().div_ceil(8)];
+    for (i, _) in have.iter().enumerate().filter(|(_, h)| **h) {
+        out[i / 8] |= 1 << (i % 8);
     }
+    out
 }
 
-// ---- Answering (peer side) ----
-
-pub async fn send_bitfield(send: &mut SendStream, have: &[bool]) -> Result<(), ProtocolError> {
-    let bytes: Vec<u8> = have.iter().map(|&b| b as u8).collect();
-    send.write_all(&bytes).await
-        .map_err(|e| ProtocolError::Send { message: e.to_string() })?;
-    send.finish().map_err(|e| ProtocolError::Send { message: e.to_string() })?;
-    Ok(())
+/// Unpack exactly `len` bits; missing bytes count as "don't have".
+pub(crate) fn unpack_bits(bytes: &[u8], len: usize) -> Vec<bool> {
+    (0..len).map(|i| bytes.get(i / 8).is_some_and(|b| b & (1 << (i % 8)) != 0)).collect()
 }
 
-/// `None` means "I don't have that piece."
-pub async fn send_piece_response(send: &mut SendStream, encoded: Option<&[u8]>) -> Result<(), ProtocolError> {
-    let bytes = match encoded {
-        Some(data) => {
-            let mut b = vec![1u8];
-            b.extend_from_slice(data);
-            b
-        }
-        None => vec![0u8],
-    };
-    send.write_all(&bytes).await
-        .map_err(|e| ProtocolError::Send { message: e.to_string() })?;
-    send.finish().map_err(|e| ProtocolError::Send { message: e.to_string() })?;
-    Ok(())
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-// ---- Reading an answer (leecher side) ----
-
-pub async fn receive_bitfield(recv: &mut RecvStream, total_pieces: usize) -> Result<Vec<bool>, ProtocolError> {
-    let bytes = recv.read_to_end(total_pieces).await
-        .map_err(|e| ProtocolError::Receive { message: e.to_string() })?;
-    // A peer that sends a short (or long) bitfield must not cause an
-    // out-of-bounds index later; missing entries mean "doesn't have it".
-    let mut have: Vec<bool> = bytes.iter().map(|&b| b == 1).collect();
-    have.resize(total_pieces, false);
-    Ok(have)
-}
-
-/// `None` means the peer told us they don't have that piece.
-pub async fn receive_piece_response(recv: &mut RecvStream) -> Result<Option<Vec<u8>>, ProtocolError> {
-    let bytes = recv.read_to_end(10_000_000).await
-        .map_err(|e| ProtocolError::Receive { message: e.to_string() })?;
-
-    match bytes.first() {
-        Some(0) => Ok(None),
-        Some(1) => Ok(Some(bytes[1..].to_vec())),
-        _ => Err(ProtocolError::Receive { message: "unrecognized response tag".to_string() }),
+    #[test]
+    fn bits_round_trip_and_tolerate_short_input() {
+        let have = vec![true, false, true, true, false, false, false, false, true, false];
+        assert_eq!(unpack_bits(&pack_bits(&have), have.len()), have);
+        assert_eq!(unpack_bits(&[0b1], 3), vec![true, false, false]);
+        assert_eq!(unpack_bits(&[], 2), vec![false, false]);
     }
 }

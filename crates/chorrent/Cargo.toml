@@ -10,7 +10,6 @@ iroh.workspace = true
 tokio = { workspace = true, features = ["rt", "sync", "time", "macros"] }
 bao-tree.workspace = true
 thiserror.workspace = true
-iroh-tickets.workspace = true
 blake3.workspace = true
 iroh-gossip.workspace = true
 serde.workspace = true
@@ -18,7 +17,17 @@ postcard = { workspace = true, features = ["alloc"] }
 futures-lite.workspace = true
 rand.workspace = true
 base64.workspace = true
+redb.workspace = true
+iroh-mainline-address-lookup = { workspace = true, optional = true }
+
+[features]
+default = []
+# Also publish/look up node addresses on the BitTorrent Mainline DHT, so share
+# codes keep reaching a peer after its address changes, without relying only
+# on n0's DNS service. Only relay addresses are published, never IPs.
+mainline = ["dep:iroh-mainline-address-lookup"]
 
 [dev-dependencies]
 tempfile.workspace = true
+postcard.workspace = true
 tokio = { workspace = true, features = ["full"] }

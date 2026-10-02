@@ -1,81 +1,199 @@
+//! Decides which piece to ask which peer for next.
+//!
+//! - The few pieces right after the first missing one are fetched in order
+//!   (keeps the start of a file playable while it downloads).
+//! - Everything else is rarest-first, so scarce pieces spread through the
+//!   swarm before their only holder leaves.
+//! - Endgame: once every missing piece is already requested, idle peers also
+//!   request in-flight pieces, so one slow peer can't stall the finish.
+
 use std::collections::HashMap;
-use rand::prelude::IndexedRandom;
+use std::hash::Hash;
 
-/// For now, just a plain identifier string for a peer (their ticket, or
-/// eventually their EndpointId). The scheduler doesn't need to know
-/// anything about how peers are actually reached over the network.
-pub type PeerId = String;
+/// Maximum peers asked for the same piece at once during endgame.
+const ENDGAME_DUPLICATES: usize = 3;
+/// How many candidate pieces rarest-first looks at before choosing. Keeps a
+/// pick cheap on huge shares. The scan starts at the first missing piece, so
+/// ties go to the lowest index: writing files roughly front to back matters,
+/// because on Windows a write far past the written part of a file stalls
+/// while the filesystem zero-fills everything before it.
+const RAREST_SAMPLE: usize = 64;
 
-pub struct SwarmState {
-    pub total_pieces: usize,
-    /// Which pieces we already have.
-    pub have: Vec<bool>,
-    /// Which pieces each known peer has.
-    pub peer_bitfields: HashMap<PeerId, Vec<bool>>,
+#[derive(Debug, Clone, PartialEq)]
+enum Piece<K> {
+    Missing,
+    InFlight(Vec<K>),
+    Done,
 }
 
-impl SwarmState {
-    /// If multiple peers have this piece, prefer whichever one holds
-    /// fewer pieces overall — i.e. actually favor the scarcer peer,
-    /// instead of picking arbitrarily.
-    fn peer_with_piece(&self, piece: usize) -> Option<PeerId> {
-        let min_count = self
-            .peer_bitfields
-            .iter()
-            .filter(|(_, bits)| bits[piece])
-            .map(|(_, bits)| bits.iter().filter(|&&b| b).count())
-            .min()?;
-
-        let candidates: Vec<&PeerId> = self
-            .peer_bitfields
-            .iter()
-            .filter(|(_, bits)| bits[piece] && bits.iter().filter(|&&b| b).count() == min_count)
-            .map(|(peer, _)| peer)
-            .collect();
-
-        candidates.choose(&mut rand::rng()).map(|&p| p.clone())
-    }
-
-    fn peers_with_piece_count(&self, piece: usize) -> usize {
-        self.peer_bitfields.values().filter(|bits| bits[piece]).count()
-    }
+#[derive(Debug)]
+pub(crate) struct Scheduler<K> {
+    pieces: Vec<Piece<K>>,
+    /// How many connected peers hold each piece.
+    availability: Vec<u32>,
+    peers: HashMap<K, Vec<bool>>,
+    urgent_window: usize,
+    /// Every piece before this one is Done.
+    first_not_done: usize,
+    missing: usize,
+    done: usize,
 }
 
-/// Decide the single next piece to request, and who to request it from.
-/// `playhead` = the piece index playback is currently at.
-/// `window`   = how many pieces ahead of the playhead count as "urgent."
-pub fn next_piece_to_request(
-    state: &SwarmState,
-    playhead: usize,
-    window: usize,
-) -> Option<(usize, PeerId)> {
-    // 1. Urgent zone: fill in order, earliest missing piece first.
-    let window_end = (playhead + window).min(state.total_pieces);
-    for piece in playhead..window_end {
-        if !state.have[piece]
-            && let Some(peer) = state.peer_with_piece(piece)
+impl<K: Eq + Hash + Clone> Scheduler<K> {
+    /// `have` is what's already on disk (all false for a fresh download).
+    pub fn new(have: &[bool], urgent_window: usize) -> Self {
+        let pieces: Vec<_> = have.iter().map(|&h| if h { Piece::Done } else { Piece::Missing }).collect();
+        let done = have.iter().filter(|&&h| h).count();
+        let mut s = Self {
+            availability: vec![0; pieces.len()],
+            missing: pieces.len() - done,
+            pieces,
+            peers: HashMap::new(),
+            urgent_window,
+            first_not_done: 0,
+            done,
+        };
+        s.advance_playhead();
+        s
+    }
+
+    pub fn is_done(&self) -> bool {
+        self.done == self.pieces.len()
+    }
+
+    pub fn add_peer(&mut self, peer: K, have: Vec<bool>) {
+        self.remove_peer(&peer);
+        for (i, &h) in have.iter().enumerate().take(self.pieces.len()) {
+            if h {
+                self.availability[i] += 1;
+            }
+        }
+        self.peers.insert(peer, have);
+    }
+
+    pub fn set_peer_has(&mut self, peer: &K, piece: usize) {
+        if let Some(bits) = self.peers.get_mut(peer)
+            && piece < bits.len()
+            && !bits[piece]
         {
-            return Some((piece, peer));
+            bits[piece] = true;
+            self.availability[piece] += 1;
         }
     }
 
-    // 2. Everywhere else: rarest-first.
-    let mut best: Option<(usize, usize)> = None; // (piece, how many peers have it)
-    for piece in 0..state.total_pieces {
-        if state.have[piece] {
-            continue;
+    /// Forget a peer; anything only it was fetching goes back to Missing.
+    pub fn remove_peer(&mut self, peer: &K) {
+        let Some(bits) = self.peers.remove(peer) else { return };
+        for (i, h) in bits.into_iter().enumerate() {
+            if h {
+                self.availability[i] -= 1;
+            }
         }
-        let rarity = state.peers_with_piece_count(piece);
-        if rarity == 0 {
-            continue; // nobody has it yet, can't request it
-        }
-        if best.is_none_or(|(_, best_rarity)| rarity < best_rarity) {
-            best = Some((piece, rarity));
+        for i in 0..self.pieces.len() {
+            self.drop_request(i, peer);
         }
     }
 
-    let (piece, _) = best?;
-    state.peer_with_piece(piece).map(|peer| (piece, peer))
+    pub fn pick(&mut self, peer: &K) -> Option<usize> {
+        let bits = self.peers.get(peer)?;
+        let total = self.pieces.len();
+        let wanted = |i: usize| bits[i] && self.pieces[i] == Piece::Missing;
+
+        // 1. Urgent window, strictly in order.
+        let window = self.first_not_done..(self.first_not_done + self.urgent_window).min(total);
+        let mut choice = window.clone().find(|&i| wanted(i));
+
+        // 2. Rarest-first over the next few candidates.
+        if choice.is_none() && self.missing > 0 && total > 0 {
+            let start = self.first_not_done;
+            let mut best: Option<(usize, u32)> = None;
+            let mut seen = 0;
+            for i in (start..total).chain(0..start) {
+                if !wanted(i) {
+                    continue;
+                }
+                let rarity = self.availability[i];
+                if best.is_none_or(|(_, r)| rarity < r) {
+                    best = Some((i, rarity));
+                }
+                seen += 1;
+                if seen >= RAREST_SAMPLE || rarity <= 1 {
+                    break;
+                }
+            }
+            choice = best.map(|(i, _)| i);
+        }
+
+        // 3. Endgame: help with pieces others are already fetching.
+        if choice.is_none() && self.missing == 0 {
+            choice = (self.first_not_done..total)
+                .filter(|&i| bits[i])
+                .filter_map(|i| match &self.pieces[i] {
+                    Piece::InFlight(by) if by.len() < ENDGAME_DUPLICATES && !by.contains(peer) => Some((i, by.len())),
+                    _ => None,
+                })
+                .min_by_key(|&(_, n)| n)
+                .map(|(i, _)| i);
+        }
+
+        let i = choice?;
+        match &mut self.pieces[i] {
+            Piece::Missing => {
+                self.pieces[i] = Piece::InFlight(vec![peer.clone()]);
+                self.missing -= 1;
+            }
+            Piece::InFlight(by) => by.push(peer.clone()),
+            Piece::Done => unreachable!("never picks a done piece"),
+        }
+        Some(i)
+    }
+
+    /// The piece is verified and on disk. Returns true the first time.
+    pub fn complete(&mut self, piece: usize) -> bool {
+        match std::mem::replace(&mut self.pieces[piece], Piece::Done) {
+            Piece::Done => false,
+            Piece::Missing => {
+                self.missing -= 1;
+                self.done += 1;
+                self.advance_playhead();
+                true
+            }
+            Piece::InFlight(_) => {
+                self.done += 1;
+                self.advance_playhead();
+                true
+            }
+        }
+    }
+
+    /// A request failed. If the peer says it doesn't have the piece (or sent
+    /// bad data), stop asking it for that piece.
+    pub fn failed(&mut self, piece: usize, peer: &K, peer_lacks_it: bool) {
+        self.drop_request(piece, peer);
+        if peer_lacks_it
+            && let Some(bits) = self.peers.get_mut(peer)
+            && bits[piece]
+        {
+            bits[piece] = false;
+            self.availability[piece] -= 1;
+        }
+    }
+
+    fn drop_request(&mut self, piece: usize, peer: &K) {
+        if let Piece::InFlight(by) = &mut self.pieces[piece] {
+            by.retain(|p| p != peer);
+            if by.is_empty() {
+                self.pieces[piece] = Piece::Missing;
+                self.missing += 1;
+            }
+        }
+    }
+
+    fn advance_playhead(&mut self) {
+        while self.first_not_done < self.pieces.len() && self.pieces[self.first_not_done] == Piece::Done {
+            self.first_not_done += 1;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -91,32 +209,56 @@ mod tests {
     }
 
     #[test]
-    fn urgent_window_picks_earliest_missing_in_order_even_if_not_rarest() {
-        let mut peers = HashMap::new();
-        peers.insert("fast".to_string(), bits(&[5], 10));
-        peers.insert("slow".to_string(), bits(&[2], 10));
-
-        let state = SwarmState { total_pieces: 10, have: bits(&[], 10), peer_bitfields: peers };
-
-        let result = next_piece_to_request(&state, 2, 3);
-        assert_eq!(result, Some((2, "slow".to_string())));
+    fn urgent_window_goes_in_order_before_rarest() {
+        let mut s = Scheduler::new(&bits(&[0, 1], 10), 3);
+        s.add_peer("a", bits(&[2, 3, 9], 10));
+        s.add_peer("b", bits(&[2, 3], 10));
+        assert_eq!(s.pick(&"a"), Some(2));
+        assert_eq!(s.pick(&"a"), Some(3));
+        // Window (2..5) has nothing left for "a"; piece 9 is the rarest it has.
+        assert_eq!(s.pick(&"a"), Some(9));
+        assert_eq!(s.pick(&"b"), None);
     }
 
     #[test]
-    fn falls_back_to_rarest_first_beyond_the_window() {
-        let mut peers = HashMap::new();
-        peers.insert("a".to_string(), bits(&[0, 1, 2], 5));
-        peers.insert("b".to_string(), bits(&[0, 1], 5));
-
-        let state = SwarmState { total_pieces: 5, have: bits(&[], 5), peer_bitfields: peers };
-
-        let result = next_piece_to_request(&state, 0, 0);
-        assert_eq!(result, Some((2, "a".to_string())));
+    fn rarest_piece_is_preferred_outside_the_window() {
+        let mut s = Scheduler::new(&bits(&[], 6), 0);
+        s.add_peer("a", bits(&[0, 1, 2, 3, 4, 5], 6));
+        s.add_peer("b", bits(&[0, 1, 2, 3, 5], 6));
+        assert_eq!(s.pick(&"a"), Some(4));
     }
 
     #[test]
-    fn returns_none_when_nothing_is_available() {
-        let state = SwarmState { total_pieces: 3, have: bits(&[0, 1, 2], 3), peer_bitfields: HashMap::new() };
-        assert_eq!(next_piece_to_request(&state, 0, 3), None);
+    fn failures_and_departures_put_pieces_back() {
+        let mut s = Scheduler::new(&bits(&[], 2), 2);
+        s.add_peer("a", bits(&[0, 1], 2));
+        s.add_peer("b", bits(&[0, 1], 2));
+        assert_eq!(s.pick(&"a"), Some(0));
+        s.failed(0, &"a", true); // a doesn't really have 0
+        assert_eq!(s.pick(&"a"), Some(1));
+        assert_eq!(s.pick(&"b"), Some(0));
+        s.remove_peer(&"a"); // piece 1 is free again
+        assert_eq!(s.pick(&"b"), Some(1));
+    }
+
+    #[test]
+    fn endgame_duplicates_in_flight_pieces_and_finishes_once() {
+        let mut s = Scheduler::new(&bits(&[0], 2), 2);
+        s.add_peer("slow", bits(&[1], 2));
+        s.add_peer("fast", bits(&[1], 2));
+        assert_eq!(s.pick(&"slow"), Some(1));
+        assert_eq!(s.pick(&"fast"), Some(1)); // endgame duplicate
+        assert_eq!(s.pick(&"fast"), None); // already asked
+        assert!(s.complete(1));
+        assert!(!s.complete(1));
+        assert!(s.is_done());
+    }
+
+    #[test]
+    fn nothing_to_pick_from_unknown_or_empty_peers() {
+        let mut s = Scheduler::new(&bits(&[], 3), 3);
+        assert_eq!(s.pick(&"ghost"), None);
+        s.add_peer("empty", bits(&[], 3));
+        assert_eq!(s.pick(&"empty"), None);
     }
 }

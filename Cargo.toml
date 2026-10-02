@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/chorrent", "crates/chorrent-cli"]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 license-file = "LICENSE"
 
@@ -14,14 +14,15 @@ tokio = "1"
 bao-tree = "0.16"
 anyhow = "1"
 thiserror = "2.0.20"
-iroh-tickets = "1"
 blake3 = "1"
 iroh-gossip = "0.101.0"
 serde = { version = "1.0.229", features = ["derive"] }
 postcard = "1.1.3"
 futures-lite = "2.6.1"
-clap = { version = "4.6.7", features = ["derive"] }
+clap = { version = "4.6.7", features = ["derive", "env"] }
 rand = "0.10.2"
 base64 = "0.23.1"
 indicatif = "0.18.6"
 tempfile = "3"
+redb = "4.3.0"
+iroh-mainline-address-lookup = "0.6.0"

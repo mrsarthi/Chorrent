@@ -10,7 +10,7 @@ name = "chorrent"
 path = "src/main.rs"
 
 [dependencies]
-chorrent.workspace = true
+chorrent = { workspace = true, features = ["mainline"] }
 tokio = { workspace = true, features = ["full"] }
 anyhow.workspace = true
 clap.workspace = true

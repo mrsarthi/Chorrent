@@ -30,11 +30,23 @@ pub enum Error {
     #[error("could not connect to any discovered peer")]
     NoPeersConnected,
 
-    #[error("downloaded file does not match the expected root hash")]
-    HashMismatch,
+    #[error("can't share {}: its name {reason}", path.display())]
+    UnsupportedName { path: PathBuf, reason: String },
 
-    #[error("this client is already seeding a file (one seed per client for now)")]
-    AlreadySeeding,
+    #[error("the share's file list is invalid: {0}")]
+    BadManifest(String),
+
+    #[error("downloaded file {} does not match its expected hash", .0.display())]
+    HashMismatch(PathBuf),
+
+    #[error("this client is already sharing that content")]
+    AlreadySharing,
+
+    #[error("persistent state error: {0}")]
+    Storage(String),
+
+    #[error("the data dir {} is in use by another chorrent client", .0.display())]
+    DataDirInUse(PathBuf),
 
     #[error("the transfer was cancelled")]
     Cancelled,

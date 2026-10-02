@@ -1,69 +1,64 @@
 use crate::error::Error;
-use base64::{engine::general_purpose::STANDARD, Engine};
-use iroh_tickets::endpoint::EndpointTicket;
+use crate::manifest::ShareId;
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use iroh::{EndpointAddr, EndpointId};
+use iroh_gossip::proto::TopicId;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::str::FromStr;
 
-/// Everything a downloader needs to find a file's swarm and verify it.
+const SHARE_CODE_PREFIX: &str = "chr2";
+
+/// Everything a downloader needs to find a share's swarm and verify it.
 ///
 /// Parse one with `str::parse` and print one with `Display`; the text form is
-/// what you hand to other people.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// what you hand to other people. A private share's code contains its secret,
+/// so anyone holding the code can join.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShareCode {
-    pub(crate) ticket: EndpointTicket,
-    pub(crate) root_hash: blake3::Hash,
+    pub(crate) id: ShareId,
+    pub(crate) name: String,
     pub(crate) total_size: u64,
-    pub(crate) file_name: String,
-}
-
-/// The on-the-wire shape, kept identical to the pre-library CLI so existing
-/// share codes still parse. Protocol v2 will replace it.
-#[derive(Serialize, Deserialize)]
-struct WireShareCode {
-    ticket: String,
-    root_hash: String,
-    total_size: u64,
-    file_name: String,
+    /// Peers to try first, before gossip finds more.
+    pub(crate) peers: Vec<EndpointAddr>,
+    pub(crate) secret: Option<[u8; 32]>,
 }
 
 impl ShareCode {
-    /// BLAKE3/Bao root hash of the file, as hex.
-    pub fn root_hash(&self) -> String {
-        self.root_hash.to_hex().to_string()
+    /// Identifies the share's content (the hash of its file list).
+    pub fn id(&self) -> ShareId {
+        self.id
     }
 
+    /// Name of the shared file or top-level folder, as the seeder named it.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Combined size of all files, in bytes, as the share code states it.
+    /// A download fails if the actual file list doesn't match.
     pub fn total_size(&self) -> u64 {
         self.total_size
     }
 
-    /// The name the seeder gave the file. Untrusted input: use
-    /// [`ShareCode::safe_file_name`] when turning it into a path.
-    pub fn file_name(&self) -> &str {
-        &self.file_name
+    /// Whether only holders of this code can find or download the share.
+    pub fn is_private(&self) -> bool {
+        self.secret.is_some()
     }
 
-    /// The file name with any directory parts stripped, so a malicious share
-    /// code can't make a download land outside the current directory.
-    pub fn safe_file_name(&self) -> String {
-        std::path::Path::new(&self.file_name)
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .filter(|n| !n.is_empty())
-            .unwrap_or_else(|| "download".to_string())
+    pub(crate) fn topic(&self) -> TopicId {
+        topic_for(self.id, self.secret.as_ref())
+    }
+
+    pub(crate) fn bootstrap_ids(&self) -> Vec<EndpointId> {
+        self.peers.iter().map(|a| a.id).collect()
     }
 }
 
 impl fmt::Display for ShareCode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let wire = WireShareCode {
-            ticket: self.ticket.to_string(),
-            root_hash: self.root_hash.to_hex().to_string(),
-            total_size: self.total_size,
-            file_name: self.file_name.clone(),
-        };
-        let bytes = postcard::to_allocvec(&wire).map_err(|_| fmt::Error)?;
-        f.write_str(&STANDARD.encode(bytes))
+        let bytes = postcard::to_allocvec(self).map_err(|_| fmt::Error)?;
+        write!(f, "{SHARE_CODE_PREFIX}{}", URL_SAFE_NO_PAD.encode(bytes))
     }
 }
 
@@ -71,17 +66,56 @@ impl FromStr for ShareCode {
     type Err = Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let bytes = STANDARD
-            .decode(s.trim())
+        let body = s.trim().strip_prefix(SHARE_CODE_PREFIX).ok_or_else(|| {
+            Error::InvalidShareCode("not a chorrent v2 share code (should start with \"chr2\")".into())
+        })?;
+        let bytes = URL_SAFE_NO_PAD
+            .decode(body)
             .map_err(|e| Error::InvalidShareCode(format!("not valid base64: {e}")))?;
-        let wire: WireShareCode = postcard::from_bytes(&bytes)
-            .map_err(|e| Error::InvalidShareCode(format!("corrupted: {e}")))?;
-        let root_hash = blake3::Hash::from_hex(&wire.root_hash)
-            .map_err(|e| Error::InvalidShareCode(format!("bad root hash: {e}")))?;
-        let ticket = wire
-            .ticket
-            .parse()
-            .map_err(|e| Error::InvalidShareCode(format!("bad ticket: {e}")))?;
-        Ok(Self { ticket, root_hash, total_size: wire.total_size, file_name: wire.file_name })
+        postcard::from_bytes(&bytes).map_err(|e| Error::InvalidShareCode(format!("corrupted: {e}")))
+    }
+}
+
+/// The gossip topic for a share. Public shares use a topic anyone with the
+/// share id can compute; private ones mix in the secret, so knowing the
+/// content alone isn't enough to find the swarm.
+pub(crate) fn topic_for(id: ShareId, secret: Option<&[u8; 32]>) -> TopicId {
+    let bytes = match secret {
+        None => blake3::keyed_hash(&blake3::derive_key("chorrent v2 public topic", &[]), &id.0),
+        Some(secret) => blake3::keyed_hash(&blake3::derive_key("chorrent v2 private topic", secret), &id.0),
+    };
+    TopicId::from_bytes(*bytes.as_bytes())
+}
+
+/// Proof that the peer `requester` knows a private share's secret. It's bound
+/// to the requester's endpoint id (authenticated by QUIC), so a token
+/// overheard on the wire is useless to anyone else.
+pub(crate) fn access_token(secret: &[u8; 32], requester: &EndpointId) -> [u8; 32] {
+    *blake3::keyed_hash(&blake3::derive_key("chorrent v2 access", secret), requester.as_bytes()).as_bytes()
+}
+
+pub(crate) fn new_secret() -> [u8; 32] {
+    rand::random()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn private_topics_differ_from_public_and_by_secret() {
+        let id = ShareId([1; 32]);
+        let public = topic_for(id, None);
+        assert_ne!(public, topic_for(id, Some(&[2; 32])));
+        assert_ne!(topic_for(id, Some(&[2; 32])), topic_for(id, Some(&[3; 32])));
+    }
+
+    #[test]
+    fn share_code_round_trips_and_rejects_v1() {
+        let code = ShareCode { id: ShareId([7; 32]), name: "x".into(), total_size: 5, peers: vec![], secret: Some([1; 32]) };
+        let text = code.to_string();
+        assert!(text.starts_with("chr2"));
+        assert_eq!(text.parse::<ShareCode>().unwrap(), code);
+        assert!("kAFlbmRwb2ludA".parse::<ShareCode>().is_err());
     }
 }
