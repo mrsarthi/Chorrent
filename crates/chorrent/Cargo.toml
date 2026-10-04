@@ -3,7 +3,12 @@ name = "chorrent"
 description = "Peer-to-peer and swarm file transfer over Iroh/QUIC with verified, chunked downloads"
 version.workspace = true
 edition.workspace = true
-license-file.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+readme = "README.md"
+keywords = ["p2p", "file-transfer", "iroh", "quic", "swarm"]
+categories = ["network-programming", "filesystem"]
 
 [dependencies]
 iroh.workspace = true
@@ -28,6 +33,10 @@ default = []
 # codes keep reaching a peer after its address changes, without relying only
 # on n0's DNS service. Only relay addresses are published, never IPs.
 mainline = ["dep:iroh-mainline-address-lookup"]
+
+[package.metadata.docs.rs]
+# Document the optional DHT support too.
+all-features = true
 
 [dev-dependencies]
 tempfile.workspace = true

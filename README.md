@@ -279,6 +279,12 @@ carries on without saving anything.
 The `chorrent` crate (`crates/chorrent`) does all the work. The command-line program is a thin
 layer over it.
 
+Add it to your project:
+```bash
+cargo add chorrent                      # or: cargo add chorrent --features mainline
+```
+API docs: <https://docs.rs/chorrent>
+
 ```rust
 let client = chorrent::Client::builder()
     .data_dir("state")            // optional: remember identity + resume downloads

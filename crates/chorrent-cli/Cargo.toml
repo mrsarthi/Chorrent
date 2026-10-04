@@ -3,7 +3,11 @@ name = "chorrent-cli"
 description = "Command-line client for the chorrent p2p file transfer library"
 version.workspace = true
 edition.workspace = true
-license-file.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+# Not published to crates.io; install with `cargo install --path crates/chorrent-cli`.
+publish = false
 
 [[bin]]
 name = "chorrent"
