@@ -1,23 +1,28 @@
 use crate::error::NodeError;
+use crate::handler::ChorrentProtocol;
 use crate::protocol::ALPN;
 use iroh::endpoint::{presets, Connection};
-use iroh::protocol::Router;
+use iroh::protocol::{AcceptError, ProtocolHandler, Router};
 use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey};
 use iroh_gossip::Gossip;
 use std::sync::Arc;
 
+/// The network side of a client: an iroh endpoint, either our own or one
+/// the embedding app already runs.
 pub(crate) struct ChorrentNode {
     endpoint: Endpoint,
-    gossip: Gossip,
-    router: Router,
+    handler: ChorrentProtocol,
+    gossip: Option<Gossip>,
+    /// Only when we own the endpoint; an embedding app routes connections itself.
+    router: Option<Router>,
 }
 
 impl ChorrentNode {
-    /// Bind a node that can dial out, and accepts incoming connections
-    /// for both our own protocol and gossip.
-    pub async fn bind<H: iroh::protocol::ProtocolHandler>(
-        handler: H,
+    /// Bind our own endpoint, accepting our protocol (and gossip, if enabled).
+    pub async fn bind(
+        handler: ChorrentProtocol,
         secret_key: SecretKey,
+        gossip: bool,
         mainline_dht: bool,
     ) -> Result<Self, NodeError> {
         let builder = Endpoint::builder(presets::N0).secret_key(secret_key);
@@ -33,14 +38,39 @@ impl ChorrentNode {
             .await
             .map_err(|e| NodeError::Bind { message: e.to_string() })?;
 
-        let gossip = Gossip::builder().spawn(endpoint.clone());
+        let gossip = gossip.then(|| Gossip::builder().spawn(endpoint.clone()));
+        let mut router = Router::builder(endpoint.clone()).accept(ALPN, Arc::new(handler.clone()));
+        if let Some(gossip) = &gossip {
+            router = router.accept(iroh_gossip::ALPN, gossip.clone());
+        }
+        Ok(Self { endpoint, handler, gossip, router: Some(router.spawn()) })
+    }
 
-        let router = Router::builder(endpoint.clone())
-            .accept(ALPN, Arc::new(handler))
-            .accept(iroh_gossip::ALPN, gossip.clone())
-            .spawn();
+    /// Use an endpoint the embedding app owns. It must list our ALPNs and
+    /// pass matching incoming connections to [`ChorrentNode::handle`].
+    pub fn attach(endpoint: Endpoint, handler: ChorrentProtocol, gossip: bool) -> Self {
+        let gossip = gossip.then(|| Gossip::builder().spawn(endpoint.clone()));
+        Self { endpoint, handler, gossip, router: None }
+    }
 
-        Ok(Self { endpoint, gossip, router })
+    pub fn alpns(&self) -> Vec<Vec<u8>> {
+        let mut alpns = vec![ALPN.to_vec()];
+        if self.gossip.is_some() {
+            alpns.push(iroh_gossip::ALPN.to_vec());
+        }
+        alpns
+    }
+
+    /// Serve an incoming connection the embedding app accepted for us.
+    pub async fn handle(&self, connection: Connection) -> Result<(), AcceptError> {
+        if connection.alpn() == ALPN {
+            self.handler.accept(connection).await
+        } else if let Some(gossip) = self.gossip.as_ref().filter(|_| connection.alpn() == iroh_gossip::ALPN) {
+            gossip.accept(connection).await
+        } else {
+            connection.close(0u32.into(), b"unknown protocol");
+            Ok(())
+        }
     }
 
     pub fn id(&self) -> EndpointId {
@@ -65,12 +95,28 @@ impl ChorrentNode {
             .map_err(|e| NodeError::Connect { message: e.to_string() })
     }
 
-    pub fn gossip(&self) -> &Gossip {
-        &self.gossip
+    /// Our relay server, if we are connected to one right now.
+    pub fn relay(&self) -> Option<String> {
+        use iroh::Watcher;
+        self.endpoint
+            .home_relay_status()
+            .get()
+            .into_iter()
+            .find(|s| s.is_connected())
+            .map(|s| s.url().to_string())
     }
 
-    /// Stop accepting connections and close the endpoint.
+    pub fn gossip(&self) -> Option<&Gossip> {
+        self.gossip.as_ref()
+    }
+
+    /// Stop. Closes the endpoint only if it's ours.
     pub async fn shutdown(&self) {
-        let _ = self.router.shutdown().await;
+        if let Some(router) = &self.router {
+            let _ = router.shutdown().await;
+        }
+        if let Some(gossip) = &self.gossip {
+            let _ = gossip.shutdown().await;
+        }
     }
 }

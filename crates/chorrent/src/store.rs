@@ -8,7 +8,10 @@
 
 use crate::chunker::FileOutboard;
 use crate::error::{Error, Result};
-use crate::local::{LocalFile, LocalShare};
+use crate::local::{LocalFile, LocalShare, StoreConfig};
+use crate::storage::FileData;
+use iroh::EndpointId;
+use std::collections::HashSet;
 use crate::manifest::{Manifest, ShareId};
 use crate::share::ShareCode;
 use iroh::SecretKey;
@@ -25,6 +28,8 @@ const SEEDS: TableDefinition<&str, &[u8]> = TableDefinition::new("seeds");
 const DOWNLOADS: TableDefinition<&str, &[u8]> = TableDefinition::new("downloads");
 /// same key as DOWNLOADS → per-file outboards
 const PROGRESS: TableDefinition<&str, &[u8]> = TableDefinition::new("progress");
+/// share id hex → allowlisted peer ids (absent: no allowlist)
+const ACCESS: TableDefinition<&str, &[u8]> = TableDefinition::new("access");
 
 #[derive(Serialize, Deserialize)]
 struct SeedRecord {
@@ -83,7 +88,7 @@ impl Store {
             e => storage_err(e),
         })?;
         let tx = db.begin_write().map_err(storage_err)?;
-        for table in [META, SEEDS, DOWNLOADS, PROGRESS] {
+        for table in [META, SEEDS, DOWNLOADS, PROGRESS, ACCESS] {
             tx.open_table(table).map_err(storage_err)?;
         }
         tx.commit().map_err(storage_err)?;
@@ -123,6 +128,18 @@ impl Store {
         Ok(out)
     }
 
+    /// Refuse a storage key other than the one this data dir was first used
+    /// with: a wrong key would make every stored file unreadable. Only a
+    /// one-way fingerprint of the key is kept.
+    pub fn check_storage_key(&self, key: &[u8; 32]) -> Result<()> {
+        let fingerprint = blake3::derive_key("chorrent storage key fingerprint v1", key);
+        match self.get(META, "storage_key_fingerprint")? {
+            None => self.put(META, "storage_key_fingerprint", &fingerprint),
+            Some(saved) if saved == fingerprint => Ok(()),
+            Some(_) => Err(Error::Storage("this data dir was set up with a different storage key".into())),
+        }
+    }
+
     /// The node's secret key, created on first use. Keeping it stable means
     /// share codes handed out earlier still reach us after a restart.
     pub fn node_key(&self) -> Result<SecretKey> {
@@ -140,15 +157,16 @@ impl Store {
 
     pub fn remember_seed(&self, share: &LocalShare) -> Result<()> {
         let record = SeedRecord {
-            root: share.root_path(),
+            root: share.root.clone(),
             secret: share.secret,
             manifest: share.manifest_bytes.clone(),
             files: share
                 .files
                 .iter()
                 .map(|f| {
-                    let (size, mtime) = modified(&f.path).unwrap_or((0, 0));
-                    (f.path.clone(), size, mtime)
+                    let path = f.data.path().to_path_buf();
+                    let (size, mtime) = modified(&path).unwrap_or((0, 0));
+                    (path, size, mtime)
                 })
                 .collect(),
             outboards: share.outboard_snapshots(),
@@ -157,40 +175,81 @@ impl Store {
         self.put(SEEDS, &share.id.to_string(), &bytes)
     }
 
-    /// Rebuild a seed from saved state, re-hashing only if any file changed
-    /// on disk since it was saved.
+    /// Rebuild a seed from saved state. Plain files are re-hashed only if
+    /// they changed on disk since; files in the encrypted store are checked
+    /// against their hashes if they changed (they shouldn't).
     pub fn load_seed(
         &self,
         id: &ShareId,
         events: tokio::sync::broadcast::Sender<crate::event::Event>,
+        store: Option<&StoreConfig>,
     ) -> Result<LocalShare> {
-        let bytes = self.get(SEEDS, &id.to_string())?.ok_or_else(|| storage_err("no such saved seed"))?;
+        let bytes = self.get(SEEDS, &id.to_string())?.ok_or_else(|| Error::NotAvailable(format!("no saved share {id}")))?;
         let record: SeedRecord = postcard::from_bytes(&bytes).map_err(storage_err)?;
         let unchanged = record.files.iter().all(|(path, size, mtime)| modified(path) == Some((*size, *mtime)));
-        if unchanged && record.outboards.len() == record.files.len() {
-            let manifest = Manifest::decode_verified(&record.manifest, *id)?;
-            let files = record
-                .files
-                .iter()
-                .zip(record.outboards)
-                .zip(manifest.files())
-                .map(|(((path, _, _), data), entry)| {
-                    let mut outboard: FileOutboard = crate::chunker::empty_outboard(entry.root_hash(), entry.size());
-                    outboard.data = data;
-                    LocalFile { path: path.clone(), outboard: std::sync::Mutex::new(outboard) }
-                })
-                .collect();
-            return Ok(LocalShare::from_parts(manifest, record.manifest, files, record.secret, events, true));
+        let manifest = Manifest::decode_verified(&record.manifest, *id)?;
+        let key = store.and_then(|s| s.key.as_ref());
+        let mut files = Vec::with_capacity(record.files.len());
+        for ((path, _, _), entry) in record.files.iter().zip(manifest.files()) {
+            let data = FileData::detect(path.clone(), key, entry.size())
+                .map_err(|source| Error::Io { path: path.clone(), source })?;
+            files.push(data);
         }
-        let share = LocalShare::from_disk(&record.root, record.secret, events)?;
-        if share.id != *id {
-            return Err(Error::BadManifest(format!("{} changed since it was shared", record.root.display())));
+        let encrypted = files.iter().any(FileData::is_encrypted);
+        if !unchanged && !encrypted {
+            let share = LocalShare::from_disk(&record.root, record.secret, events, None)?;
+            if share.id != *id {
+                return Err(Error::BadManifest(format!("{} changed since it was shared", record.root.display())));
+            }
+            share.set_allowed(self.load_allowed(id));
+            return Ok(share);
         }
+        if record.outboards.len() != files.len() {
+            return Err(storage_err("saved share is incomplete"));
+        }
+        let files = files
+            .into_iter()
+            .zip(record.outboards)
+            .zip(manifest.files())
+            .map(|((data, saved), entry)| {
+                let mut outboard: FileOutboard = crate::chunker::empty_outboard(entry.root_hash(), entry.size());
+                outboard.data = saved;
+                LocalFile::new(data, outboard)
+            })
+            .collect();
+        let share = LocalShare::from_parts(manifest, record.manifest, files, record.secret, events, true, record.root);
+        if !unchanged {
+            share.verify()?;
+        }
+        share.set_allowed(self.load_allowed(id));
         Ok(share)
     }
 
+    /// The saved location of a share, if we have it.
+    pub fn seed_root(&self, id: &ShareId) -> Option<PathBuf> {
+        let bytes = self.get(SEEDS, &id.to_string()).ok()??;
+        postcard::from_bytes::<SeedRecord>(&bytes).ok().map(|r| r.root)
+    }
+
+    pub fn remember_allowed(&self, id: &ShareId, peers: Option<&HashSet<EndpointId>>) -> Result<()> {
+        match peers {
+            None => self.remove(&[ACCESS], &id.to_string()),
+            Some(peers) => {
+                let raw: Vec<[u8; 32]> = peers.iter().map(|p| *p.as_bytes()).collect();
+                let bytes = postcard::to_allocvec(&raw).map_err(storage_err)?;
+                self.put(ACCESS, &id.to_string(), &bytes)
+            }
+        }
+    }
+
+    pub fn load_allowed(&self, id: &ShareId) -> Option<HashSet<EndpointId>> {
+        let bytes = self.get(ACCESS, &id.to_string()).ok()??;
+        let raw: Vec<[u8; 32]> = postcard::from_bytes(&bytes).ok()?;
+        Some(raw.iter().filter_map(|b| EndpointId::from_bytes(b).ok()).collect())
+    }
+
     pub fn forget(&self, id: &ShareId) -> Result<()> {
-        self.remove(&[SEEDS], &id.to_string())?;
+        self.remove(&[SEEDS, ACCESS], &id.to_string())?;
         for (key, _) in self.entries(DOWNLOADS)? {
             if key.starts_with(&format!("{id}|")) {
                 self.remove(&[DOWNLOADS, PROGRESS], &key)?;

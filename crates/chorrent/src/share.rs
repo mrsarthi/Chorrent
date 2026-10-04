@@ -50,8 +50,23 @@ impl ShareCode {
         topic_for(self.id, self.secret.as_ref())
     }
 
-    pub(crate) fn bootstrap_ids(&self) -> Vec<EndpointId> {
-        self.peers.iter().map(|a| a.id).collect()
+    /// Add the peers listed in `other`, a code for the same share (e.g. a
+    /// second seeder's code), so a download can start from all of them.
+    pub fn merge(&mut self, other: &ShareCode) -> Result<(), Error> {
+        if other.id != self.id || other.secret != self.secret {
+            return Err(Error::InvalidShareCode("those share codes are for different shares".into()));
+        }
+        for peer in &other.peers {
+            if !self.peers.iter().any(|p| p.id == peer.id) {
+                self.peers.push(peer.clone());
+            }
+        }
+        Ok(())
+    }
+
+    /// Ids of the peers this code lists, as strings.
+    pub fn peer_ids(&self) -> Vec<String> {
+        self.peers.iter().map(|p| p.id.to_string()).collect()
     }
 }
 

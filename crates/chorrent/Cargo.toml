@@ -18,6 +18,8 @@ futures-lite.workspace = true
 rand.workspace = true
 base64.workspace = true
 redb.workspace = true
+chacha20poly1305.workspace = true
+positioned-io.workspace = true
 iroh-mainline-address-lookup = { workspace = true, optional = true }
 
 [features]
@@ -29,5 +31,7 @@ mainline = ["dep:iroh-mainline-address-lookup"]
 
 [dev-dependencies]
 tempfile.workspace = true
+iroh-gossip.workspace = true
+iroh.workspace = true
 postcard.workspace = true
 tokio = { workspace = true, features = ["full"] }

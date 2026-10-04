@@ -19,7 +19,9 @@
 //! let download = client.download(&code, None).await?;
 //! let mut events = download.events(); // progress, peers, ...
 //! let done = download.finished().await?;
-//! println!("saved to {}", done.path.display());
+//! if let Some(path) = &done.path {
+//!     println!("saved to {}", path.display());
+//! }
 //! # Ok(()) }
 //! ```
 
@@ -39,14 +41,24 @@ mod protocol;
 mod registration;
 mod scheduler;
 mod share;
+mod storage;
 mod store;
 
-pub use client::{Client, ClientBuilder, DownloadHandle, Finished, SeedHandle, SeedOptions, Transfer};
+pub use client::{
+    Client, ClientBuilder, DownloadHandle, DownloadOptions, Finished, NetworkStatus, PeerCheck, SeedHandle,
+    SeedOptions, Transfer,
+};
+/// Re-exported so embedding apps name the same types (keep your iroh
+/// dependency semver-compatible with chorrent's).
+pub use iroh::{Endpoint, EndpointId};
 pub use error::{Error, Result};
 pub use event::Event;
 pub use manifest::{FileEntry, Manifest, ShareId};
 pub use share::ShareCode;
 pub use store::SavedTransfer;
+
+/// The ALPN chorrent's protocol uses; see [`Client::alpns`] for the full list.
+pub const ALPN: &[u8] = protocol::ALPN;
 
 /// Size of one piece, in bytes.
 pub const PIECE_SIZE: u64 = chunker::BLOCK_SIZE.bytes() as u64;

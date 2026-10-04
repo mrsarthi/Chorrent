@@ -2,7 +2,8 @@
 //! BLAKE3/Bao root hash. The share's id is the hash of its encoded manifest,
 //! so a downloader can fetch the manifest from any peer and check it.
 
-use crate::chunker::BLOCK_SIZE;
+use crate::chunker::{FileOutboard, BLOCK_SIZE};
+use crate::storage::FileData;
 use crate::error::{Error, Result};
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -143,9 +144,14 @@ impl Manifest {
         Ok(())
     }
 
-    /// Build the manifest for a file or folder on disk, hashing every file.
-    /// Returns the manifest plus each file's location and full outboard.
-    pub(crate) fn from_disk(root: &Path) -> Result<(Manifest, Vec<(PathBuf, crate::chunker::FileOutboard)>)> {
+    /// Build the manifest for a file or folder on disk. `ingest` is called
+    /// for each file (index, path, size) and returns where its bytes will be
+    /// served from plus its full outboard: hashed in place, or copied into
+    /// the encrypted store while hashing.
+    pub(crate) fn from_disk(
+        root: &Path,
+        mut ingest: impl FnMut(usize, &Path, u64) -> Result<(FileData, FileOutboard)>,
+    ) -> Result<(Manifest, Vec<(FileData, FileOutboard)>)> {
         let name = portable_name(root, root.file_name())?;
 
         let mut found = Vec::new();
@@ -162,16 +168,26 @@ impl Manifest {
 
         let mut files = Vec::new();
         let mut hashed = Vec::new();
-        for (components, path) in found {
-            let outboard = crate::chunker::hash_file(&path)?;
+        for (index, (components, path)) in found.into_iter().enumerate() {
+            let size = std::fs::metadata(&path).map_err(|source| Error::Io { path: path.clone(), source })?.len();
+            let (data, outboard) = ingest(index, &path, size)?;
             files.push(FileEntry {
                 path: components,
                 size: outboard.tree.size(),
                 root_hash: *outboard.root.as_bytes(),
             });
-            hashed.push((path, outboard));
+            hashed.push((data, outboard));
         }
         Ok((Manifest { name, files }, hashed))
+    }
+
+    /// A share of one file that arrived as a stream rather than a path.
+    pub(crate) fn single(name: &str, outboard: &FileOutboard) -> Result<Manifest> {
+        if let Some(reason) = name_problem(name) {
+            return Err(Error::UnsupportedName { path: PathBuf::from(name), reason: reason.into() });
+        }
+        let file = FileEntry { path: vec![name.to_string()], size: outboard.tree.size(), root_hash: *outboard.root.as_bytes() };
+        Ok(Manifest { name: name.to_string(), files: vec![file] })
     }
 }
 
@@ -337,7 +353,8 @@ mod tests {
             let root = dir.path().join("share");
             std::fs::create_dir(&root).unwrap();
             std::fs::write(root.join(bad), b"x").unwrap();
-            assert!(matches!(Manifest::from_disk(&root), Err(Error::UnsupportedName { .. })), "{bad}");
+            let plain = |_: usize, p: &Path, _: u64| Ok((FileData::Plain(p.to_path_buf()), crate::chunker::hash_file(p)?));
+            assert!(matches!(Manifest::from_disk(&root, plain), Err(Error::UnsupportedName { .. })), "{bad}");
         }
     }
 

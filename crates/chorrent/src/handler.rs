@@ -15,6 +15,9 @@ use std::time::Duration;
 use tokio::sync::{broadcast, Semaphore};
 use tokio::task::JoinSet;
 
+/// How long a piece request may wait for a free upload slot.
+const UPLOAD_SLOT_WAIT: Duration = Duration::from_secs(10);
+
 /// Every share this node is currently serving, by id.
 pub(crate) type Registry = Arc<RwLock<HashMap<ShareId, SharedShare>>>;
 
@@ -77,7 +80,10 @@ impl ChorrentProtocol {
         if index >= share.total_pieces() || !share.has(index) {
             return Response::DontHave;
         }
-        let Ok(_permit) = self.upload_slots.try_acquire() else {
+        // Wait a while for a free upload slot rather than refusing at once: a
+        // distant downloader keeps many requests queued, and refusing them
+        // would only cause retries.
+        let Ok(Ok(_permit)) = tokio::time::timeout(UPLOAD_SLOT_WAIT, self.upload_slots.acquire()).await else {
             return Response::Busy;
         };
         if let Some(limiter) = &self.upload_rate {

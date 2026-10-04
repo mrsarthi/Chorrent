@@ -2,7 +2,7 @@
 //! pieces from every peer at once while (optionally) serving what we already
 //! have to others.
 
-use crate::discovery::{self, Announcement};
+use crate::discovery::{self, Swarm};
 use crate::error::{Error, ProtocolError, Result};
 use crate::event::Event;
 use crate::handler::Registry;
@@ -14,13 +14,13 @@ use crate::protocol::{self, unpack_bits, Request, Response};
 use crate::registration::Registration;
 use crate::scheduler::Scheduler;
 use crate::share::{access_token, ShareCode};
+use crate::storage::MasterKey;
 use crate::store::Store;
 use iroh::endpoint::Connection;
 use iroh::{EndpointAddr, EndpointId};
-use iroh_gossip::api::{GossipReceiver, GossipSender};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{broadcast, mpsc, watch, Notify};
@@ -28,11 +28,20 @@ use tokio::task::JoinSet;
 use tokio::time::Instant;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+/// The first connection attempt to a peer while looking for the manifest;
+/// later attempts get longer.
+const FIRST_ATTEMPT: Duration = Duration::from_secs(4);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 /// Don't redial a peer we just tried more often than this.
 const RETRY_PEER_AFTER: Duration = Duration::from_secs(20);
 /// Requests kept in flight to each peer.
 const REQUESTS_PER_PEER: usize = 8;
+/// More requests in flight for distant peers: with a fixed number, a long
+/// round trip caps speed (8 pieces per 400 ms is only ~1.3 MB/s). Each peer
+/// gets enough to keep about this much data per second on the way...
+const TARGET_BYTES_PER_SEC: u64 = 12 * 1024 * 1024;
+/// ...but never more than this many requests (QUIC allows 100 streams).
+const MAX_REQUESTS_PER_PEER: usize = 48;
 const URGENT_WINDOW: usize = 3;
 /// Consecutive failures before we give up on a peer.
 const MAX_STRIKES: u32 = 3;
@@ -49,10 +58,17 @@ pub(crate) struct DownloadCtx {
     pub store: Option<Arc<Store>>,
     /// How long to look for a first peer that can give us the manifest.
     pub discovery_timeout: Duration,
+    /// Download into the encrypted store with this key (`dest_dir` is then
+    /// the share's store folder).
+    pub key: Option<MasterKey>,
+    /// Who may fetch from us while we reseed (None: anyone with the code).
+    pub allow: Option<HashSet<EndpointId>>,
 }
 
 pub(crate) struct DownloadOutcome {
     pub path: PathBuf,
+    pub encrypted: bool,
+    pub share: Option<SharedShare>,
     /// Present when reseeding: keeps the share served and announced.
     pub seeding: Option<(Registration, JoinSet<()>)>,
 }
@@ -61,7 +77,6 @@ pub(crate) async fn run(
     ctx: DownloadCtx,
     code: ShareCode,
     dest_dir: PathBuf,
-    (gossip_tx, gossip_rx): (GossipSender, GossipReceiver),
     events: broadcast::Sender<Event>,
     mut cancel: watch::Receiver<bool>,
 ) -> Result<DownloadOutcome> {
@@ -74,27 +89,82 @@ pub(crate) async fn run(
     for addr in &code.peers {
         let _ = found_tx.try_send(addr.clone());
     }
-    background.spawn(discovery::listen_for_peers(gossip_rx, Some(found_tx.clone())));
+    // Find more peers through the share's swarm. We start announcing
+    // ourselves only once we have something to serve.
+    let announce = Arc::new(AtomicBool::new(false));
+    if ctx.node.gossip().is_some() {
+        let swarm = Swarm {
+            node: Arc::clone(&ctx.node),
+            topic: code.topic(),
+            bootstrap: code.peers.clone(),
+            announce: Arc::clone(&announce),
+            found: Some(found_tx.clone()),
+            events: events.clone(),
+        };
+        background.spawn(async move {
+            if let Ok((sender, receiver, warm)) = discovery::join(&swarm).await {
+                discovery::keep(swarm, sender, receiver, warm).await;
+            }
+        });
+    }
     let mut tracker = PeerTracker::new(me, events.clone());
 
-    // 1. Get the manifest from the first peer that has it.
+    // 1. Get the manifest from the first peer that has it. Keep retrying
+    // every known peer until the deadline: in a 1:1 transfer there is only
+    // one, and a single stalled attempt mustn't sink the download.
     let deadline = Instant::now() + ctx.discovery_timeout;
+    let mut candidates: Vec<EndpointAddr> = Vec::new();
+    let mut attempts: HashMap<EndpointId, u32> = HashMap::new();
+    let mut next = 0;
     let (manifest, manifest_bytes, first_conn) = loop {
-        let addr = tokio::select! {
-            found = tokio::time::timeout_at(deadline, found_rx.recv()) => match found {
-                Ok(Some(addr)) => addr,
-                _ => return Err(Error::NoPeersFound(ctx.discovery_timeout)),
-            },
-            _ = cancel.wait_for(|&c| c) => return Err(Error::Cancelled),
-        };
-        if !tracker.should_try(&addr) {
+        while let Ok(addr) = found_rx.try_recv() {
+            tracker.add_candidate(&mut candidates, addr);
+        }
+        if candidates.is_empty() {
+            tokio::select! {
+                found = tokio::time::timeout_at(deadline, found_rx.recv()) => match found {
+                    Ok(Some(addr)) => tracker.add_candidate(&mut candidates, addr),
+                    _ => return Err(Error::NoPeersFound(ctx.discovery_timeout)),
+                },
+                _ = cancel.wait_for(|&c| c) => return Err(Error::Cancelled),
+            }
             continue;
         }
-        let Some(conn) = connect(&ctx.node, addr).await else { continue };
-        if let Ok((manifest, bytes)) = fetch_manifest(&conn, &code, auth).await {
-            break (manifest, bytes, conn);
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(Error::NoPeersFound(ctx.discovery_timeout));
+        }
+        let addr = candidates[next % candidates.len()].clone();
+        next += 1;
+        // Short first tries, longer later ones (a relayed connection can be slow).
+        let tries = attempts.entry(addr.id).or_insert(0);
+        let limit = (FIRST_ATTEMPT * 2u32.pow((*tries).min(4))).min(CONNECT_TIMEOUT).min(remaining);
+        *tries += 1;
+        let attempt = async {
+            let conn = tokio::time::timeout(limit, ctx.node.connect(addr)).await.ok()?.ok()?;
+            match fetch_manifest(&conn, &code, auth).await {
+                Ok((manifest, bytes)) => Some((manifest, bytes, conn)),
+                Err(_) => {
+                    conn.close(0u32.into(), b"no manifest");
+                    None
+                }
+            }
+        };
+        tokio::select! {
+            got = attempt => if let Some(found) = got { break found },
+            _ = cancel.wait_for(|&c| c) => return Err(Error::Cancelled),
+        }
+        let pause = Duration::from_millis(500).min(deadline.saturating_duration_since(Instant::now()));
+        tokio::select! {
+            _ = tokio::time::sleep(pause) => {}
+            _ = cancel.wait_for(|&c| c) => return Err(Error::Cancelled),
         }
     };
+    // Every other peer we already know of (e.g. other seeders listed in the
+    // share code) gets downloaded from too, without waiting for gossip.
+    for addr in candidates.iter().filter(|c| c.id != first_conn.remote_id()) {
+        let _ = found_tx.try_send(addr.clone());
+    }
     let _ = events.send(Event::ManifestReceived {
         name: manifest.name().to_string(),
         files: manifest.files().len(),
@@ -104,10 +174,10 @@ pub(crate) async fn run(
 
     // 2. Lay out the files, picking up where an earlier attempt left off.
     let share = {
-        let (dest_dir, events, store) = (dest_dir.clone(), events.clone(), ctx.store.clone());
+        let (dest_dir, events, store, key) = (dest_dir.clone(), events.clone(), ctx.store.clone(), ctx.key.clone());
         let secret = code.secret;
         tokio::task::spawn_blocking(move || -> Result<LocalShare> {
-            let share = LocalShare::for_download(manifest, manifest_bytes, &dest_dir, secret, events)?;
+            let share = LocalShare::for_download(manifest, manifest_bytes, &dest_dir, key.as_ref(), secret, events)?;
             if let Some(saved) = store.as_ref().and_then(|s| s.load_progress(&share.id, &dest_dir)) {
                 share.restore_progress(saved)?;
             }
@@ -116,6 +186,7 @@ pub(crate) async fn run(
         .await
         .map_err(|e| Error::Task(e.to_string()))??
     };
+    share.set_allowed(ctx.allow.clone());
     let share = Arc::new(share);
     let restored = share.have_count();
     if restored > 0 {
@@ -124,15 +195,15 @@ pub(crate) async fn run(
     }
     if let Some(store) = &ctx.store {
         store.remember_download(&code, &dest_dir)?;
+        store.remember_allowed(&share.id, ctx.allow.as_ref())?;
     }
 
     // Serve what we have to others while we download.
     let registration = if ctx.reseed {
         let registration = Registration::new(&ctx.registry, Arc::clone(&share))?;
-        background.spawn(discovery::announce_periodically(gossip_tx, Announcement { addr: ctx.node.addr() }));
+        announce.store(true, Ordering::Relaxed);
         Some(registration)
     } else {
-        drop(gossip_tx);
         None
     };
 
@@ -143,6 +214,7 @@ pub(crate) async fn run(
         wake: Notify::new(),
         finished: Notify::new(),
         connected: Mutex::new(HashSet::new()),
+        open: Mutex::new(Vec::new()),
         events: events.clone(),
         auth,
         rate: ctx.download_rate.clone(),
@@ -171,6 +243,9 @@ pub(crate) async fn run(
                 if let Some(store) = &ctx.store {
                     store.save_progress(&share, &dest_dir);
                 }
+                for conn in engine.open.lock().unwrap().drain(..) {
+                    conn.close(0u32.into(), b"cancelled");
+                }
                 return Err(Error::Cancelled);
             }
             _ = save_tick.tick() => {
@@ -181,21 +256,18 @@ pub(crate) async fn run(
         }
         while peers.try_join_next().is_some() {}
     }
-    drop(peers); // disconnects every peer
+    drop(peers);
+    // Tell peers we're done rather than letting connections just vanish.
+    for conn in engine.open.lock().unwrap().drain(..) {
+        conn.close(0u32.into(), b"done");
+    }
 
+    share.release_writers();
     // 4. Every piece was verified on arrival; check whole files anyway as a
     // final guard against bugs or the files being changed underneath us.
     {
         let share = Arc::clone(&share);
-        tokio::task::spawn_blocking(move || -> Result<()> {
-            for (file, entry) in share.files.iter().zip(share.manifest.files()) {
-                let outboard = crate::chunker::hash_file(&file.path)?;
-                if outboard.root != entry.root_hash() {
-                    return Err(Error::HashMismatch(file.path.clone()));
-                }
-            }
-            Ok(())
-        })
+        tokio::task::spawn_blocking(move || share.verify())
         .await
         .map_err(|e| Error::Task(e.to_string()))??;
     }
@@ -206,9 +278,75 @@ pub(crate) async fn run(
 
     let _ = events.send(Event::Completed);
     Ok(DownloadOutcome {
-        path: share.root_path(),
+        path: share.root.clone(),
+        encrypted: share.is_encrypted(),
+        share: Some(Arc::clone(&share)),
         seeding: registration.map(|r| (r, background)),
     })
+}
+
+/// Connect to one peer from a share code and see how well that works.
+pub(crate) async fn check_peer(node: &ChorrentNode, code: &ShareCode, addr: EndpointAddr) -> crate::client::PeerCheck {
+    use futures_lite::StreamExt;
+    let mut check = crate::client::PeerCheck {
+        peer: addr.id.to_string(),
+        listed_relay: addr.relay_urls().next().is_some(),
+        reachable: false,
+        direct: None,
+        rtt_ms: None,
+        serves_share: false,
+        problem: None,
+    };
+    if addr.id == node.id() {
+        check.problem = Some("that's this node".into());
+        return check;
+    }
+    let conn = match tokio::time::timeout(CONNECT_TIMEOUT, node.connect(addr)).await {
+        Ok(Ok(conn)) => conn,
+        Ok(Err(e)) => {
+            check.problem = Some(e.to_string());
+            return check;
+        }
+        Err(_) => {
+            check.problem = Some(format!("no answer within {}s", CONNECT_TIMEOUT.as_secs()));
+            return check;
+        }
+    };
+    check.reachable = true;
+    let auth = code.secret.map(|s| access_token(&s, &node.id()));
+    match request(&conn, &Request::Manifest { share: code.id, auth }).await {
+        Ok(Response::Manifest(_)) => check.serves_share = true,
+        Ok(_) => check.problem = Some("reachable, but it doesn't serve this share to us".into()),
+        Err(e) => check.problem = Some(format!("reachable, but the request failed: {e}")),
+    }
+    // Give hole punching a few seconds to upgrade from the relay.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut snapshots = conn.paths_stream();
+    while let Ok(Some(paths)) = tokio::time::timeout_at(deadline, snapshots.next()).await {
+        if let Some(selected) = paths.iter().find(|p| p.is_selected()) {
+            check.direct = Some(selected.is_ip());
+            check.rtt_ms = Some(selected.rtt().as_millis() as u64);
+            if selected.is_ip() {
+                break;
+            }
+        }
+    }
+    drop(snapshots);
+    conn.close(0u32.into(), b"check done");
+    check
+}
+
+/// The round-trip time of the path a connection is using right now.
+fn selected_rtt(conn: &Connection) -> Option<Duration> {
+    conn.paths().iter().find(|p| p.is_selected()).map(|p| p.rtt())
+}
+
+/// How many requests to keep in flight to a peer this far away.
+fn requests_for(rtt: Option<Duration>) -> usize {
+    let Some(rtt) = rtt else { return REQUESTS_PER_PEER };
+    let bytes_in_flight = TARGET_BYTES_PER_SEC as f64 * rtt.as_secs_f64();
+    let pieces = (bytes_in_flight / crate::chunker::BLOCK_SIZE.bytes() as f64).ceil() as usize;
+    pieces.clamp(REQUESTS_PER_PEER, MAX_REQUESTS_PER_PEER)
 }
 
 async fn watch_path(conn: Connection, peer: EndpointId, events: broadcast::Sender<Event>) {
@@ -260,25 +398,41 @@ async fn fetch_manifest(conn: &Connection, code: &ShareCode, auth: Option<[u8; 3
 /// Remembers which peers we've tried, so gossip repeats don't cause redials.
 struct PeerTracker {
     me: EndpointId,
+    /// Peers we've reported with `PeerDiscovered`.
+    discovered: HashSet<EndpointId>,
+    /// When we last dialed each peer while swarming.
     last_attempt: HashMap<EndpointId, Instant>,
     events: broadcast::Sender<Event>,
 }
 
 impl PeerTracker {
     fn new(me: EndpointId, events: broadcast::Sender<Event>) -> Self {
-        Self { me, last_attempt: HashMap::new(), events }
+        Self { me, discovered: HashSet::new(), last_attempt: HashMap::new(), events }
+    }
+
+    fn discover(&mut self, id: EndpointId) {
+        if self.discovered.insert(id) {
+            let _ = self.events.send(Event::PeerDiscovered { peer: id.to_string() });
+        }
+    }
+
+    /// Add a peer to try for the manifest (once per peer).
+    fn add_candidate(&mut self, candidates: &mut Vec<EndpointAddr>, addr: EndpointAddr) {
+        if addr.id == self.me || candidates.iter().any(|c| c.id == addr.id) {
+            return;
+        }
+        self.discover(addr.id);
+        candidates.push(addr);
     }
 
     fn should_try(&mut self, addr: &EndpointAddr) -> bool {
         if addr.id == self.me {
             return false;
         }
+        self.discover(addr.id);
         let now = Instant::now();
         match self.last_attempt.insert(addr.id, now) {
-            None => {
-                let _ = self.events.send(Event::PeerDiscovered { peer: addr.id.to_string() });
-                true
-            }
+            None => true,
             Some(previous) if now - previous < RETRY_PEER_AFTER => {
                 self.last_attempt.insert(addr.id, previous);
                 false
@@ -296,6 +450,8 @@ struct Engine {
     /// The last piece arrived.
     finished: Notify,
     connected: Mutex<HashSet<EndpointId>>,
+    /// Every connection we've used, to close cleanly when we finish.
+    open: Mutex<Vec<Connection>>,
     events: broadcast::Sender<Event>,
     auth: Option<[u8; 32]>,
     rate: Option<Arc<RateLimiter>>,
@@ -315,7 +471,9 @@ impl Engine {
         if !self.connected.lock().unwrap().insert(peer) {
             return; // already downloading from this peer over another connection
         }
+        self.open.lock().unwrap().push(conn.clone());
         let was_used = self.drive_peer(&conn, peer).await;
+        conn.close(0u32.into(), b"done");
         self.sched.lock().unwrap().remove_peer(&peer);
         self.connected.lock().unwrap().remove(&peer);
         self.wake.notify_waiters();
@@ -358,6 +516,7 @@ impl Engine {
         for _ in 0..REQUESTS_PER_PEER {
             workers.spawn(Arc::clone(self).worker(conn.clone(), peer, Arc::clone(&strikes)));
         }
+        let mut resize = tokio::time::interval(Duration::from_secs(2));
 
         let updates = async {
             loop {
@@ -372,9 +531,19 @@ impl Engine {
                 self.wake.notify_waiters();
             }
         };
-        tokio::select! {
-            _ = updates => {}
-            _ = async { while workers.join_next().await.is_some() {} } => {}
+        tokio::pin!(updates);
+        loop {
+            tokio::select! {
+                _ = &mut updates => break,
+                finished = workers.join_next() => if finished.is_none() { break },
+                _ = resize.tick() => {
+                    // Add requests for distant peers (never removes any).
+                    let wanted = requests_for(selected_rtt(conn));
+                    while workers.len() < wanted && !self.is_done() && strikes.load(Ordering::Relaxed) < MAX_STRIKES {
+                        workers.spawn(Arc::clone(self).worker(conn.clone(), peer, Arc::clone(&strikes)));
+                    }
+                }
+            }
         }
         true
     }
@@ -457,5 +626,20 @@ impl Engine {
     fn give_back(&self, piece: usize, peer: &EndpointId, peer_lacks_it: bool) {
         self.sched.lock().unwrap().failed(piece, peer, peer_lacks_it);
         self.wake.notify_waiters();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn distant_peers_get_more_requests_in_flight() {
+        let ms = |n| Some(Duration::from_millis(n));
+        assert_eq!(requests_for(None), REQUESTS_PER_PEER);
+        assert_eq!(requests_for(ms(1)), REQUESTS_PER_PEER, "nearby peers keep the minimum");
+        // 12 MiB/s over 200 ms is 2.4 MiB in flight: 39 pieces of 64 KiB.
+        assert_eq!(requests_for(ms(200)), 39);
+        assert_eq!(requests_for(ms(900)), MAX_REQUESTS_PER_PEER, "capped");
     }
 }

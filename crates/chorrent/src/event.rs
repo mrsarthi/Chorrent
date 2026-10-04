@@ -26,6 +26,10 @@ pub enum Event {
     /// relay server (works everywhere, but slower). Sent when known and
     /// again whenever it changes.
     PeerPath { peer: String, direct: bool, rtt_ms: u64 },
+    /// How many peers we are directly linked to in the share's swarm
+    /// (gossip). 0 means other seeders and downloaders cannot discover us
+    /// yet; we keep trying to (re)join. Sent whenever it changes.
+    SwarmPeers { connected: usize },
     /// We stopped using a peer (it left, or kept failing).
     PeerDisconnected { peer: String },
     /// A piece arrived, passed hash verification, and was written to disk.

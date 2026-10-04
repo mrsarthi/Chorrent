@@ -51,11 +51,12 @@ enum Command {
         #[arg(long, value_name = "SHARE_CODE")]
         join: Option<String>,
     },
-    /// Download a share
+    /// Download a share. Give one share code, or several codes for the same
+    /// share (e.g. from different seeders), optionally followed by a folder
     Get {
-        share: String,
-        /// Folder to download into [default: current folder]
-        dest_dir: Option<PathBuf>,
+        /// Share code(s), then optionally the folder to download into [default: current folder]
+        #[arg(required = true, num_args = 1.., value_name = "SHARE_CODE... [DEST_DIR]")]
+        args: Vec<String>,
         /// Keep seeding after the download finishes, until Ctrl+C
         #[arg(long)]
         seed: bool,
@@ -69,6 +70,12 @@ enum Command {
     Resume,
     /// Remove a share from saved state (files are not touched)
     Forget { share_id: String },
+    /// Check this device's connection, and optionally whether the peers in
+    /// share codes can be reached
+    Doctor {
+        /// Share code(s) to test
+        codes: Vec<String>,
+    },
 }
 
 fn parse_rate(s: &str) -> Result<u64, String> {
@@ -136,9 +143,8 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Seed { path, private, join } => run_seed(&cli.opts, path, private, join).await,
-        Command::Get { share, dest_dir, seed, no_reseed } => {
-            run_get(&cli.opts, share, dest_dir, seed, !no_reseed).await
-        }
+        Command::Get { args, seed, no_reseed } => run_get(&cli.opts, args, seed, !no_reseed).await,
+        Command::Doctor { codes } => run_doctor(&cli.opts, codes).await,
         Command::List => run_list(&cli.opts).await,
         Command::Resume => run_resume(&cli.opts).await,
         Command::Forget { share_id } => {
@@ -186,6 +192,20 @@ fn spinner_style() -> ProgressStyle {
     ProgressStyle::with_template("{spinner:.green} {prefix} {msg}").unwrap()
 }
 
+const NO_RELAY_WARNING: &str = "\
+WARNING: not connected to a relay server. Devices on other networks
+probably can't reach this one; only devices that can connect to it directly
+(e.g. on the same Wi-Fi) will. Still trying. If this doesn't go away, check
+that a firewall isn't blocking chorrent, or try another network. Run
+`chorrent doctor` for details.";
+
+fn swarm_line(connected: usize) -> String {
+    match connected {
+        0 => "Swarm: not linked to any other peers (normal until others join; retrying)".into(),
+        n => format!("Swarm: linked to {n} peer(s)"),
+    }
+}
+
 fn print_seed_info(seed: &SeedHandle) {
     let code = seed.share_code();
     println!("Sharing: {}", seed.path().display());
@@ -209,11 +229,36 @@ async fn run_seed(opts: &GlobalOpts, path: PathBuf, private: bool, join: Option<
         .await
         .with_context(|| format!("failed to share {}", path.display()))?;
     print_seed_info(&seed);
+    let mut relay = client.network_status().relay;
+    if relay.is_none() {
+        println!("{NO_RELAY_WARNING}\n");
+    }
     println!("Seeding. Press Ctrl+C to stop.");
 
-    let multi = MultiProgress::new();
-    let watcher = tokio::spawn(watch_seed(seed.events(), multi.add(ProgressBar::new_spinner()), String::new()));
-    tokio::signal::ctrl_c().await?;
+    let spinner = ProgressBar::new_spinner();
+    let watcher = tokio::spawn(watch_seed(seed.events(), spinner.clone(), String::new()));
+    let ctrl_c = tokio::signal::ctrl_c();
+    tokio::pin!(ctrl_c);
+    let mut check = tokio::time::interval(Duration::from_secs(2));
+    loop {
+        tokio::select! {
+            _ = &mut ctrl_c => break,
+            _ = check.tick() => {
+                let now = client.network_status().relay;
+                if now != relay {
+                    match &now {
+                        Some(url) => say(&spinner, format!(
+                            "Connected to relay server {url}: reachable from any network now.\n\
+                             Share this updated code (the earlier one may not work from other networks):\n{}\n",
+                            seed.share_code()
+                        )),
+                        None => say(&spinner, format!("{NO_RELAY_WARNING}\n")),
+                    }
+                    relay = now;
+                }
+            }
+        }
+    }
     watcher.abort();
     seed.stop();
     client.shutdown().await;
@@ -234,6 +279,7 @@ async fn watch_seed(mut events: tokio::sync::broadcast::Receiver<Event>, spinner
             }
             event = events.recv() => match event {
                 Ok(Event::Uploaded { bytes }) => { total += bytes; this_second += bytes; }
+                Ok(Event::SwarmPeers { connected }) if connected > 0 => say(&spinner, swarm_line(connected)),
                 Ok(_) | Err(RecvError::Lagged(_)) => {}
                 Err(RecvError::Closed) => return,
             },
@@ -276,6 +322,7 @@ async fn drive_download(download: DownloadHandle, pb: ProgressBar) -> chorrent::
                         pb.set_message(format!("{peers} peer(s)"));
                         say(&pb, format!("Peer {} left", short(&peer)));
                     }
+                    Ok(Event::SwarmPeers { connected }) if connected > 0 => say(&pb, swarm_line(connected)),
                     Ok(Event::PieceVerified { bytes, .. }) => pb.inc(bytes),
                     Ok(Event::PieceFailed { index, reason }) => {
                         say(&pb, format!("Piece {index} failed, retrying: {reason}"));
@@ -295,24 +342,56 @@ async fn drive_download(download: DownloadHandle, pb: ProgressBar) -> chorrent::
     result
 }
 
-async fn run_get(opts: &GlobalOpts, share: String, dest_dir: Option<PathBuf>, keep_seeding: bool, reseed: bool) -> Result<()> {
-    let code: ShareCode = share.parse().context("the share code you provided isn't valid")?;
+/// Share codes start with "chr2"; anything else is the destination folder.
+fn split_get_args(args: Vec<String>) -> Result<(ShareCode, Option<PathBuf>)> {
+    let (codes, rest): (Vec<String>, Vec<String>) = args.into_iter().partition(|a| a.trim().starts_with("chr"));
+    if rest.len() > 1 {
+        bail!("expected share codes and at most one destination folder, got {} other arguments", rest.len());
+    }
+    let mut codes = codes.iter().map(|c| c.parse::<ShareCode>().context("a share code you provided isn't valid"));
+    let mut code = codes.next().context("no share code given")??;
+    for other in codes {
+        code.merge(&other?)?;
+    }
+    Ok((code, rest.into_iter().next().map(PathBuf::from)))
+}
+
+async fn run_get(opts: &GlobalOpts, args: Vec<String>, keep_seeding: bool, reseed: bool) -> Result<()> {
+    let (code, dest_dir) = split_get_args(args)?;
     let client = make_client(opts, reseed, false).await?;
     println!("Downloading {} ({})", code.name(), HumanBytes(code.total_size()));
+    if code.peer_ids().len() > 1 {
+        println!("Starting from {} known seeders", code.peer_ids().len());
+    }
     let download = client.download(&code, dest_dir).await.context("failed to start the download")?;
 
     let pb = ProgressBar::new(code.total_size());
     let driver = tokio::spawn(drive_download(download, pb.clone()));
     let abort = driver.abort_handle();
-    let finished = tokio::select! {
-        result = driver => result?,
-        _ = tokio::signal::ctrl_c() => {
-            // Dropping the handle (by aborting its driver) saves progress and stops.
-            abort.abort();
-            tokio::time::sleep(Duration::from_millis(300)).await;
-            client.shutdown().await;
-            println!("\nStopped. Run `chorrent resume` (or the same `get`) to continue.");
-            return Ok(());
+    let mut driver = driver;
+    let ctrl_c = tokio::signal::ctrl_c();
+    tokio::pin!(ctrl_c);
+    // Most nodes reach a relay within a couple of seconds; warn if not.
+    let relay_check = tokio::time::sleep(Duration::from_secs(10));
+    tokio::pin!(relay_check);
+    let mut relay_checked = false;
+    let finished = loop {
+        tokio::select! {
+            result = &mut driver => break result?,
+            _ = &mut ctrl_c => {
+                // Dropping the handle (by aborting its driver) saves progress and stops.
+                abort.abort();
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                client.shutdown().await;
+                println!("\nStopped. Run `chorrent resume` (or the same `get`) to continue.");
+                return Ok(());
+            }
+            _ = &mut relay_check, if !relay_checked => {
+                relay_checked = true;
+                if client.network_status().relay.is_none() {
+                    say(&pb, format!("{NO_RELAY_WARNING}\n"));
+                }
+            }
         }
     };
 
@@ -323,7 +402,10 @@ async fn run_get(opts: &GlobalOpts, share: String, dest_dir: Option<PathBuf>, ke
             return Err(e).context("download failed");
         }
     };
-    println!("Saved to {}", finished.path.display());
+    // The CLI never uses an encrypted store, so there's always a path.
+    if let Some(path) = &finished.path {
+        println!("Saved to {}", path.display());
+    }
 
     if keep_seeding && let Some(seed) = finished.seed {
         println!("\nSeeding it too. Share this code:\n{}\n", seed.share_code());
@@ -331,6 +413,68 @@ async fn run_get(opts: &GlobalOpts, share: String, dest_dir: Option<PathBuf>, ke
         let watcher = tokio::spawn(watch_seed(seed.events(), ProgressBar::new_spinner(), String::new()));
         tokio::signal::ctrl_c().await?;
         watcher.abort();
+    }
+    client.shutdown().await;
+    Ok(())
+}
+
+async fn run_doctor(opts: &GlobalOpts, codes: Vec<String>) -> Result<()> {
+    let codes = codes
+        .iter()
+        .map(|c| c.parse::<ShareCode>().context("a share code you provided isn't valid"))
+        .collect::<Result<Vec<_>>>()?;
+    // A throwaway identity: this checks the device and its network, and
+    // shouldn't clash with a seed or download running alongside.
+    let client = Client::builder()
+        .mainline_dht(opts.dht)
+        .build()
+        .await
+        .context("failed to start")?;
+
+    println!("This device");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let mut status = client.network_status();
+    while status.relay.is_none() && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        status = client.network_status();
+    }
+    match &status.relay {
+        Some(url) => println!("  [ok]   relay server: connected to {url}"),
+        None => {
+            println!("  [FAIL] relay server: couldn't connect within 15 s");
+            println!("         Devices on other networks probably can't reach this one. Check that a");
+            println!("         firewall or VPN isn't blocking chorrent, or try another network.");
+        }
+    }
+    if status.direct_addresses.is_empty() {
+        println!("  [warn] no direct addresses found");
+    } else {
+        println!("  [info] direct addresses: {}", status.direct_addresses.join(", "));
+    }
+
+    for code in &codes {
+        println!("\nShare \"{}\" ({} peer(s) listed)", code.name(), code.peer_ids().len());
+        for check in client.check_peers(code).await {
+            let peer = short(&check.peer);
+            if !check.reachable {
+                println!("  [FAIL] peer {peer}: unreachable ({})", check.problem.as_deref().unwrap_or("unknown"));
+                if !check.listed_relay {
+                    println!("         Its share code has no relay address: that device wasn't connected to a");
+                    println!("         relay when it made the code. Have it run `chorrent doctor` itself.");
+                }
+                continue;
+            }
+            let path = match (check.direct, check.rtt_ms) {
+                (Some(true), Some(rtt)) => format!("direct, {rtt} ms"),
+                (Some(false), Some(rtt)) => format!("via relay (slower), {rtt} ms"),
+                _ => "connected".into(),
+            };
+            if check.serves_share {
+                println!("  [ok]   peer {peer}: reachable ({path}), serving this share");
+            } else {
+                println!("  [warn] peer {peer}: reachable ({path}), {}", check.problem.as_deref().unwrap_or("not serving it"));
+            }
+        }
     }
     client.shutdown().await;
     Ok(())

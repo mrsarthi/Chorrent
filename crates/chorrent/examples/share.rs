@@ -27,7 +27,7 @@ async fn main() -> chorrent::Result<()> {
                 }
             });
             let done = download.finished().await?;
-            println!("Saved to {}", done.path.display());
+            println!("Saved to {}", done.path.unwrap().display());
         }
         _ => eprintln!("usage: share seed <path> | share get <share-code>"),
     }

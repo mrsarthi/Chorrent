@@ -48,6 +48,9 @@ pub enum Error {
     #[error("the data dir {} is in use by another chorrent client", .0.display())]
     DataDirInUse(PathBuf),
 
+    #[error("not available: {0}")]
+    NotAvailable(String),
+
     #[error("the transfer was cancelled")]
     Cancelled,
 

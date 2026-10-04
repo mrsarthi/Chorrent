@@ -71,8 +71,8 @@ async fn single_file_round_trips() {
     let mut events = download.events();
     let done = finish(download).await;
 
-    assert_eq!(done.path, std::path::absolute(out.path().join("movie.bin")).unwrap());
-    assert_eq!(std::fs::read(&done.path).unwrap(), std::fs::read(&file).unwrap());
+    assert_eq!(done.path.clone().unwrap(), std::path::absolute(out.path().join("movie.bin")).unwrap());
+    assert_eq!(std::fs::read(done.path.as_ref().unwrap()).unwrap(), std::fs::read(&file).unwrap());
     assert!(drain(&mut events).contains(&Event::Completed));
     assert!(done.seed.is_some(), "reseeding is on by default");
 
@@ -101,8 +101,8 @@ async fn folder_with_nested_and_empty_files_round_trips() {
     let leecher = quick_client().await;
     let done = finish(leecher.download(&code, Some(out.path().to_path_buf())).await.unwrap()).await;
 
-    assert!(done.path.ends_with("album"));
-    assert_eq!(tree(&done.path), tree(&root));
+    assert!(done.path.as_ref().unwrap().ends_with("album"));
+    assert_eq!(tree(done.path.as_ref().unwrap()), tree(&root));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -116,7 +116,7 @@ async fn downloaders_reseed_after_the_original_seeder_leaves() {
 
     let b = quick_client().await;
     let b_out = tempfile::tempdir().unwrap();
-    let b_done = finish(b.download(seed_a.share_code(), Some(b_out.path().to_path_buf())).await.unwrap()).await;
+    let b_done = finish(b.download(&seed_a.share_code(), Some(b_out.path().to_path_buf())).await.unwrap()).await;
     let b_seed = b_done.seed.expect("b reseeds");
 
     // The original seeder goes away; c can only get the file from b.
@@ -125,8 +125,8 @@ async fn downloaders_reseed_after_the_original_seeder_leaves() {
 
     let c = quick_client().await;
     let c_out = tempfile::tempdir().unwrap();
-    let c_done = finish(c.download(b_seed.share_code(), Some(c_out.path().to_path_buf())).await.unwrap()).await;
-    assert_eq!(std::fs::read(&c_done.path).unwrap(), std::fs::read(&file).unwrap());
+    let c_done = finish(c.download(&b_seed.share_code(), Some(c_out.path().to_path_buf())).await.unwrap()).await;
+    assert_eq!(std::fs::read(c_done.path.as_ref().unwrap()).unwrap(), std::fs::read(&file).unwrap());
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -144,7 +144,7 @@ async fn private_shares_need_the_secret() {
     let out = tempfile::tempdir().unwrap();
     let ok = quick_client().await;
     let done = finish(ok.download(&code, Some(out.path().to_path_buf())).await.unwrap()).await;
-    assert_eq!(std::fs::read(&done.path).unwrap(), std::fs::read(&file).unwrap());
+    assert_eq!(std::fs::read(done.path.as_ref().unwrap()).unwrap(), std::fs::read(&file).unwrap());
 
     // Same share id and seeder address, but no secret: the seeder won't answer.
     let forged = strip_secret(code.clone());
@@ -178,11 +178,11 @@ async fn downloads_pull_from_several_seeders() {
     // Slow enough that gossip has time to introduce the second seeder.
     let leecher = Client::builder().download_limit(Some(128 * 1024)).build().await.unwrap();
     let out = tempfile::tempdir().unwrap();
-    let download = leecher.download(seed_a.share_code(), Some(out.path().to_path_buf())).await.unwrap();
+    let download = leecher.download(&seed_a.share_code(), Some(out.path().to_path_buf())).await.unwrap();
     let mut events = download.events();
     let done = finish(download).await;
 
-    assert_eq!(std::fs::read(&done.path).unwrap(), std::fs::read(&file).unwrap());
+    assert_eq!(std::fs::read(done.path.as_ref().unwrap()).unwrap(), std::fs::read(&file).unwrap());
     let connected = drain(&mut events)
         .into_iter()
         .filter(|e| matches!(e, Event::PeerConnected { .. }))
@@ -232,7 +232,7 @@ async fn cancelled_downloads_resume_where_they_left_off() {
     };
     let mut events = download.events();
     let done = finish(download).await;
-    assert_eq!(std::fs::read(&done.path).unwrap(), std::fs::read(&file).unwrap());
+    assert_eq!(std::fs::read(done.path.as_ref().unwrap()).unwrap(), std::fs::read(&file).unwrap());
 
     let resumed = drain(&mut events).into_iter().find_map(|e| match e {
         Event::Resumed { pieces, .. } => Some(pieces),
