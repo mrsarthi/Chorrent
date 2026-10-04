@@ -17,6 +17,8 @@ struct App {
     client: Arc<Client>,
     data: tempfile::TempDir,
     accept_loop: tokio::task::JoinHandle<()>,
+    /// The app's identity, to restart it as the same peer (like EchoIt does).
+    secret: iroh::SecretKey,
 }
 
 async fn app(key: [u8; 32]) -> App {
@@ -29,7 +31,12 @@ async fn app_in(key: [u8; 32], data: tempfile::TempDir) -> App {
 }
 
 async fn app_with(key: [u8; 32], data: tempfile::TempDir, download_limit: Option<u64>) -> App {
+    app_as(key, data, download_limit, iroh::SecretKey::generate()).await
+}
+
+async fn app_as(key: [u8; 32], data: tempfile::TempDir, download_limit: Option<u64>, secret: iroh::SecretKey) -> App {
     let endpoint = Endpoint::builder(presets::N0)
+        .secret_key(secret.clone())
         .alpns(vec![APP_ALPN.to_vec(), chorrent::ALPN.to_vec()])
         .bind()
         .await
@@ -64,7 +71,7 @@ async fn app_with(key: [u8; 32], data: tempfile::TempDir, download_limit: Option
             }
         }
     });
-    App { endpoint, client, data, accept_loop }
+    App { endpoint, client, data, accept_loop, secret }
 }
 
 fn content(len: usize) -> Vec<u8> {
@@ -180,7 +187,7 @@ async fn streams_can_be_shared_and_everything_survives_a_restart() {
 
     // Restart bob with the same data dir and key.
     // Stop the accept loop first: it holds the client, which holds the data dir.
-    let App { client, data, accept_loop, endpoint } = bob;
+    let App { client, data, accept_loop, endpoint, .. } = bob;
     accept_loop.abort();
     let _ = accept_loop.await;
     Arc::into_inner(client).expect("nothing else holds the client").shutdown().await;
@@ -242,4 +249,134 @@ async fn interrupted_encrypted_downloads_resume() {
     assert!(resumed.is_some_and(|p| p >= 6), "expected to resume with >= 6 pieces, got {resumed:?}");
     assert_eq!(bob.client.read_range(&done.id, 0, 0, secret.len()).await.unwrap(), secret);
     assert!(!leaks(bob.data.path(), &secret));
+}
+
+/// Every byte under `dir`: file contents, plus every file and folder name.
+fn raw_disk_image(dir: &Path) -> Vec<u8> {
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        out.extend(path.file_name().unwrap().to_string_lossy().as_bytes());
+        out.push(b'\n');
+        if path.is_dir() {
+            out.extend(raw_disk_image(&path));
+        } else {
+            // Never skip a file: a locked database that can't be read would
+            // make this check pass without looking at it.
+            out.extend(std::fs::read(&path).unwrap_or_else(|e| panic!("can't read {}: {e}", path.display())));
+        }
+    }
+    out
+}
+
+/// Shut an app down completely (accept loop, client, endpoint) so its data
+/// dir is closed and can be read, and hand back the data dir.
+async fn stop(app: App) -> (tempfile::TempDir, iroh::SecretKey) {
+    let App { client, data, accept_loop, endpoint, secret } = app;
+    accept_loop.abort();
+    let _ = accept_loop.await;
+    Arc::into_inner(client).expect("nothing else holds the client").shutdown().await;
+    endpoint.close().await;
+    (data, secret)
+}
+
+/// Which of the named byte strings appear anywhere under `dir`.
+fn found_on_disk(dir: &Path, needles: &[(&str, Vec<u8>)]) -> Vec<String> {
+    let image = raw_disk_image(dir);
+    needles
+        .iter()
+        .filter(|(_, needle)| image.windows(needle.len()).any(|w| w == needle.as_slice()))
+        .map(|(what, _)| what.to_string())
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn nothing_identifying_is_readable_on_disk() {
+    let alice = app([1; 32]).await;
+    let bob = app_with([2; 32], tempfile::tempdir().unwrap(), Some(256 * 1024)).await;
+
+    let src = tempfile::tempdir().unwrap();
+    let name = "Quarterly Secret Plans.pdf";
+    let file = src.path().join(name);
+    std::fs::write(&file, content(24 * PIECE_SIZE as usize)).unwrap();
+    let seed = alice
+        .client
+        .seed_with(&file, SeedOptions::default().private(true).allow_peers([bob.endpoint.id()]))
+        .await
+        .unwrap();
+    let code = seed.share_code();
+
+    // The secret is the last 32 bytes of the code's postcard form.
+    let code_bytes = postcard::to_allocvec(&code).unwrap();
+    let secret = code_bytes[code_bytes.len() - 32..].to_vec();
+    let id = code.id();
+    let needles = [
+        ("file name", name.as_bytes().to_vec()),
+        ("file name stem", b"Quarterly Secret".to_vec()),
+        ("private secret", secret),
+        ("share id", id.as_bytes().to_vec()),
+        ("share id (hex)", id.to_string().into_bytes()),
+        ("bob's id", bob.endpoint.id().as_bytes().to_vec()),
+        ("bob's id (hex)", bob.endpoint.id().to_string().into_bytes()),
+        ("alice's id", alice.endpoint.id().as_bytes().to_vec()),
+        ("alice's id (hex)", alice.endpoint.id().to_string().into_bytes()),
+    ];
+
+    // Mid-download: a pending download, saved progress and an allowlist exist.
+    let download = bob
+        .client
+        .download_with(&code, DownloadOptions::default().allow_peers([alice.endpoint.id()]))
+        .await
+        .unwrap();
+    let mut events = download.events();
+    let mut verified = 0;
+    while verified < 6 {
+        if let Ok(chorrent::Event::PieceVerified { .. }) = events.recv().await {
+            verified += 1;
+        }
+    }
+    download.cancel();
+    assert!(matches!(download.finished().await, Err(Error::Cancelled)));
+    assert!(!bob.client.saved().unwrap().is_empty(), "the unfinished download is saved");
+    let (bob_data, bob_secret) = stop(bob).await;
+    assert_eq!(found_on_disk(bob_data.path(), &needles), Vec::<String>::new(), "receiver, mid-download");
+
+    // Restart bob (same identity, same sealed data dir) and finish: it's now a saved seed.
+    let bob = app_as([2; 32], bob_data, None, bob_secret).await;
+    let saved = bob.client.saved().unwrap();
+    let chorrent::Transfer::Download(download) = bob.client.resume(&saved[0]).await.unwrap() else {
+        panic!("expected the saved download");
+    };
+    let done = download.finished().await.unwrap();
+    assert_eq!(bob.client.manifest(&done.id).await.unwrap().name(), name, "readable through the API");
+    drop(done);
+    let (bob_data, _) = stop(bob).await;
+    assert_eq!(found_on_disk(bob_data.path(), &needles), Vec::<String>::new(), "receiver, finished");
+
+    drop(seed);
+    let (alice_data, _) = stop(alice).await;
+    assert_eq!(found_on_disk(alice_data.path(), &needles), Vec::<String>::new(), "sender");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sealed_and_plain_data_dirs_are_never_mixed() {
+    // A plain data dir with records (like one written by chorrent 0.5.0).
+    let plain = tempfile::tempdir().unwrap();
+    {
+        let client = Client::builder().data_dir(plain.path()).build().await.unwrap();
+        let src = tempfile::tempdir().unwrap();
+        std::fs::write(src.path().join("a.txt"), b"hello").unwrap();
+        let _seed = client.seed(src.path().join("a.txt")).await.unwrap();
+        client.shutdown().await;
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let with_key = Client::builder().data_dir(plain.path()).encrypted_storage([4; 32]).build().await;
+    assert!(matches!(with_key, Err(Error::Storage(ref m)) if m.contains("without encryption")), "plain dir + key");
+
+    // A sealed data dir can't be opened without its key.
+    let sealed = tempfile::tempdir().unwrap();
+    drop(Client::builder().data_dir(sealed.path()).encrypted_storage([4; 32]).build().await.unwrap());
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let without_key = Client::builder().data_dir(sealed.path()).build().await;
+    assert!(matches!(without_key, Err(Error::Storage(ref m)) if m.contains("encrypted")), "sealed dir, no key");
 }

@@ -47,9 +47,17 @@ impl StoreConfig {
         self.blobs.join(format!("import-{}", hex(&rand::random::<[u8; 8]>())))
     }
 
-    /// The folder a download of `id` goes to, the same every time so it resumes.
+    /// The folder a download of `id` goes to, the same every time so it
+    /// resumes. With encryption its name is a keyed hash: a share id is the
+    /// content's hash, and shouldn't be readable from the folder name.
     pub fn download_dir(&self, id: &ShareId) -> PathBuf {
-        self.blobs.join(id.to_string())
+        match &self.key {
+            None => self.blobs.join(id.to_string()),
+            Some(key) => {
+                let name = blake3::keyed_hash(&key.derive("chorrent blob folder names v1"), id.as_bytes());
+                self.blobs.join(name.to_hex().as_str())
+            }
+        }
     }
 }
 

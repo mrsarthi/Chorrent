@@ -5,6 +5,18 @@
 //! have verified so far). On resume, those are checked against what is
 //! actually on disk, so a stale or tampered state file can't make us serve
 //! or keep bad data.
+//!
+//! ## Sealed databases
+//!
+//! With a storage key (`ClientBuilder::encrypted_storage`), nothing readable
+//! is left in the database: every value is encrypted (XChaCha20-Poly1305,
+//! bound to its table and record), and record names, which would otherwise
+//! contain share ids and paths, are replaced by keyed hashes. The real name
+//! travels inside the sealed value. Both keys are derived from the storage
+//! key, never the storage key itself.
+//!
+//! A database is either sealed or plain, never a mix: opening a plain one
+//! that has records with a key, or a sealed one without the key, is refused.
 
 use crate::chunker::FileOutboard;
 use crate::error::{Error, Result};
@@ -15,7 +27,9 @@ use std::collections::HashSet;
 use crate::manifest::{Manifest, ShareId};
 use crate::share::ShareCode;
 use iroh::SecretKey;
-use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
+use chacha20poly1305::aead::{Aead, KeyInit, Payload};
+use chacha20poly1305::{XChaCha20Poly1305, XNonce};
+use redb::{Database, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition, TableHandle};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -30,6 +44,14 @@ const DOWNLOADS: TableDefinition<&str, &[u8]> = TableDefinition::new("downloads"
 const PROGRESS: TableDefinition<&str, &[u8]> = TableDefinition::new("progress");
 /// share id hex → allowlisted peer ids (absent: no allowlist)
 const ACCESS: TableDefinition<&str, &[u8]> = TableDefinition::new("access");
+/// The tables holding records (everything but the format markers in META).
+const RECORD_TABLES: [TableDefinition<&str, &[u8]>; 4] = [SEEDS, DOWNLOADS, PROGRESS, ACCESS];
+
+/// META entries stored unsealed: they're needed before any key is checked,
+/// and neither reveals anything.
+const FORMAT: &str = "format";
+const SEALED_V1: &[u8] = b"sealed-v1";
+const FINGERPRINT: &str = "storage_key_fingerprint";
 
 #[derive(Serialize, Deserialize)]
 struct SeedRecord {
@@ -64,6 +86,64 @@ pub(crate) struct Store {
     db: Database,
     /// Serializes progress writes; redb allows one writer at a time anyway.
     write_lock: Mutex<()>,
+    /// Present when the database is sealed.
+    sealer: Option<Sealer>,
+}
+
+/// Encrypts values and hides record names for a sealed database.
+struct Sealer {
+    cipher: XChaCha20Poly1305,
+    names: [u8; 32],
+}
+
+impl Sealer {
+    fn new(storage_key: &[u8; 32]) -> Self {
+        let values = blake3::derive_key("chorrent database values v1", storage_key);
+        Self {
+            cipher: XChaCha20Poly1305::new(&values.into()),
+            names: blake3::derive_key("chorrent database names v1", storage_key),
+        }
+    }
+
+    /// What a record is stored under: a keyed hash, so ids and paths in
+    /// record names don't show.
+    fn name(&self, table: &str, name: &str) -> String {
+        let mut hasher = blake3::Hasher::new_keyed(&self.names);
+        hasher.update(table.as_bytes());
+        hasher.update(&[0]);
+        hasher.update(name.as_bytes());
+        hasher.finalize().to_hex().to_string()
+    }
+
+    /// Nonce | ciphertext of (real name, value), bound to table and stored name.
+    fn seal(&self, table: &str, stored_name: &str, name: &str, value: &[u8]) -> Result<Vec<u8>> {
+        let plain = postcard::to_allocvec(&(name, value)).map_err(storage_err)?;
+        let nonce: [u8; 24] = rand::random();
+        let aad = format!("{table}\0{stored_name}");
+        let sealed = self
+            .cipher
+            .encrypt(&XNonce::from(nonce), Payload { msg: &plain, aad: aad.as_bytes() })
+            .map_err(|_| storage_err("could not encrypt a database record"))?;
+        let mut out = nonce.to_vec();
+        out.extend(sealed);
+        Ok(out)
+    }
+
+    /// The real name and value of a sealed record.
+    fn open(&self, table: &str, stored_name: &str, sealed: &[u8]) -> Result<(String, Vec<u8>)> {
+        let unreadable = || storage_err("a database record is damaged or was written with another key");
+        if sealed.len() < 24 {
+            return Err(unreadable());
+        }
+        let (nonce, ciphertext) = sealed.split_at(24);
+        let nonce = XNonce::try_from(nonce).map_err(|_| unreadable())?;
+        let aad = format!("{table}\0{stored_name}");
+        let plain = self
+            .cipher
+            .decrypt(&nonce, Payload { msg: ciphertext, aad: aad.as_bytes() })
+            .map_err(|_| unreadable())?;
+        postcard::from_bytes::<(String, Vec<u8>)>(&plain).map_err(|_| unreadable())
+    }
 }
 
 fn storage_err(e: impl std::fmt::Display) -> Error {
@@ -81,7 +161,9 @@ fn modified(path: &Path) -> Option<(u64, u128)> {
 }
 
 impl Store {
-    pub fn open(data_dir: &Path) -> Result<Self> {
+    /// Open the data dir's database. With `storage_key`, it's sealed (see the
+    /// module docs); a plain database that already has records is refused.
+    pub fn open(data_dir: &Path, storage_key: Option<&[u8; 32]>) -> Result<Self> {
         std::fs::create_dir_all(data_dir).map_err(|source| Error::Io { path: data_dir.to_path_buf(), source })?;
         let db = Database::create(data_dir.join("chorrent.redb")).map_err(|e| match e {
             redb::DatabaseError::DatabaseAlreadyOpen => Error::DataDirInUse(data_dir.to_path_buf()),
@@ -92,52 +174,129 @@ impl Store {
             tx.open_table(table).map_err(storage_err)?;
         }
         tx.commit().map_err(storage_err)?;
-        Ok(Self { db, write_lock: Mutex::new(()) })
+        let store = Self { db, write_lock: Mutex::new(()), sealer: storage_key.map(Sealer::new) };
+        store.check_format(storage_key)?;
+        Ok(store)
     }
 
-    fn get(&self, table: TableDefinition<&str, &[u8]>, key: &str) -> Result<Option<Vec<u8>>> {
+    /// Make sure the database is sealed exactly when we have a key, and that
+    /// it's the right key. Only a one-way fingerprint of the key is kept.
+    fn check_format(&self, storage_key: Option<&[u8; 32]>) -> Result<()> {
+        let format = self.raw_get(META, FORMAT)?;
+        let saved_fingerprint = self.raw_get(META, FINGERPRINT)?;
+        match storage_key {
+            Some(key) => {
+                let fingerprint = blake3::derive_key("chorrent storage key fingerprint v1", key);
+                if saved_fingerprint.as_deref().is_some_and(|saved| saved != fingerprint) {
+                    return Err(Error::Storage("this data dir was set up with a different storage key".into()));
+                }
+                match format.as_deref() {
+                    Some(SEALED_V1) => Ok(()),
+                    Some(_) => Err(Error::Storage("this data dir was written by a newer chorrent".into())),
+                    None if self.has_records()? => Err(Error::Storage(
+                        "this data dir already has records stored without encryption (written by chorrent \
+                         0.5.0, or without a storage key). Encrypted storage needs a data dir of its own: \
+                         use a new folder, or delete this one to start over"
+                            .into(),
+                    )),
+                    None => {
+                        self.raw_put(META, FINGERPRINT, &fingerprint)?;
+                        self.raw_put(META, FORMAT, SEALED_V1)
+                    }
+                }
+            }
+            None if format.is_some() || saved_fingerprint.is_some() => Err(Error::Storage(
+                "this data dir is encrypted; open it with its storage key (ClientBuilder::encrypted_storage)".into(),
+            )),
+            None => Ok(()),
+        }
+    }
+
+    /// Whether anything besides format markers was ever stored.
+    fn has_records(&self) -> Result<bool> {
+        let tx = self.db.begin_read().map_err(storage_err)?;
+        for table in RECORD_TABLES {
+            if !tx.open_table(table).map_err(storage_err)?.is_empty().map_err(storage_err)? {
+                return Ok(true);
+            }
+        }
+        let meta = tx.open_table(META).map_err(storage_err)?;
+        for entry in meta.iter().map_err(storage_err)? {
+            let (name, _) = entry.map_err(storage_err)?;
+            if name.value() != FORMAT && name.value() != FINGERPRINT {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn raw_get(&self, table: TableDefinition<&str, &[u8]>, name: &str) -> Result<Option<Vec<u8>>> {
         let tx = self.db.begin_read().map_err(storage_err)?;
         let t = tx.open_table(table).map_err(storage_err)?;
-        Ok(t.get(key).map_err(storage_err)?.map(|v| v.value().to_vec()))
+        Ok(t.get(name).map_err(storage_err)?.map(|v| v.value().to_vec()))
     }
 
-    fn put(&self, table: TableDefinition<&str, &[u8]>, key: &str, value: &[u8]) -> Result<()> {
+    fn raw_put(&self, table: TableDefinition<&str, &[u8]>, name: &str, value: &[u8]) -> Result<()> {
         let _guard = self.write_lock.lock().unwrap();
         let tx = self.db.begin_write().map_err(storage_err)?;
-        tx.open_table(table).map_err(storage_err)?.insert(key, value).map_err(storage_err)?;
+        tx.open_table(table).map_err(storage_err)?.insert(name, value).map_err(storage_err)?;
         tx.commit().map_err(storage_err)
     }
 
-    fn remove(&self, tables: &[TableDefinition<&str, &[u8]>], key: &str) -> Result<()> {
+    /// The name a record is stored under (hidden when sealed).
+    fn stored_name(&self, table: TableDefinition<&str, &[u8]>, name: &str) -> String {
+        match &self.sealer {
+            Some(sealer) => sealer.name(table.name(), name),
+            None => name.to_string(),
+        }
+    }
+
+    fn get(&self, table: TableDefinition<&str, &[u8]>, name: &str) -> Result<Option<Vec<u8>>> {
+        let stored = self.stored_name(table, name);
+        let Some(value) = self.raw_get(table, &stored)? else { return Ok(None) };
+        match &self.sealer {
+            None => Ok(Some(value)),
+            Some(sealer) => {
+                let (real_name, value) = sealer.open(table.name(), &stored, &value)?;
+                if real_name != name {
+                    return Err(storage_err("a database record doesn't belong where it's stored"));
+                }
+                Ok(Some(value))
+            }
+        }
+    }
+
+    fn put(&self, table: TableDefinition<&str, &[u8]>, name: &str, value: &[u8]) -> Result<()> {
+        let stored = self.stored_name(table, name);
+        match &self.sealer {
+            None => self.raw_put(table, &stored, value),
+            Some(sealer) => self.raw_put(table, &stored, &sealer.seal(table.name(), &stored, name, value)?),
+        }
+    }
+
+    fn remove(&self, tables: &[TableDefinition<&str, &[u8]>], name: &str) -> Result<()> {
         let _guard = self.write_lock.lock().unwrap();
         let tx = self.db.begin_write().map_err(storage_err)?;
         for table in tables {
-            tx.open_table(*table).map_err(storage_err)?.remove(key).map_err(storage_err)?;
+            let stored = self.stored_name(*table, name);
+            tx.open_table(*table).map_err(storage_err)?.remove(stored.as_str()).map_err(storage_err)?;
         }
         tx.commit().map_err(storage_err)
     }
 
+    /// Every record in a table, by its real name.
     fn entries(&self, table: TableDefinition<&str, &[u8]>) -> Result<Vec<(String, Vec<u8>)>> {
         let tx = self.db.begin_read().map_err(storage_err)?;
         let t = tx.open_table(table).map_err(storage_err)?;
         let mut out = Vec::new();
         for entry in t.iter().map_err(storage_err)? {
             let (k, v) = entry.map_err(storage_err)?;
-            out.push((k.value().to_string(), v.value().to_vec()));
+            out.push(match &self.sealer {
+                None => (k.value().to_string(), v.value().to_vec()),
+                Some(sealer) => sealer.open(table.name(), k.value(), v.value())?,
+            });
         }
         Ok(out)
-    }
-
-    /// Refuse a storage key other than the one this data dir was first used
-    /// with: a wrong key would make every stored file unreadable. Only a
-    /// one-way fingerprint of the key is kept.
-    pub fn check_storage_key(&self, key: &[u8; 32]) -> Result<()> {
-        let fingerprint = blake3::derive_key("chorrent storage key fingerprint v1", key);
-        match self.get(META, "storage_key_fingerprint")? {
-            None => self.put(META, "storage_key_fingerprint", &fingerprint),
-            Some(saved) if saved == fingerprint => Ok(()),
-            Some(_) => Err(Error::Storage("this data dir was set up with a different storage key".into())),
-        }
     }
 
     /// The node's secret key, created on first use. Keeping it stable means

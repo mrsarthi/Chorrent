@@ -368,7 +368,7 @@ dependencies = [
 
 [[package]]
 name = "chorrent"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "bao-tree",
  "base64 0.23.1",
@@ -390,7 +390,7 @@ dependencies = [
 
 [[package]]
 name = "chorrent-cli"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "anyhow",
  "chorrent",

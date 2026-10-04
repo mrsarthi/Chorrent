@@ -83,13 +83,19 @@ impl ClientBuilder {
         self
     }
 
-    /// Keep everything this client stores (downloads, and copies of what it
-    /// seeds) encrypted at rest with this key, e.g. one held in the OS
-    /// keychain. Plaintext only leaves the store through
+    /// Keep everything this client stores encrypted at rest with this key,
+    /// e.g. one held in the OS keychain: downloads, copies of what it seeds,
+    /// and its database (file names, share codes and secrets, progress, and
+    /// who may download what). Even the names of saved records and folders
+    /// are hidden. Plaintext only leaves the store through
     /// [`Client::read_range`] and [`Client::export_file`]. Needs a
     /// [`ClientBuilder::data_dir`].
     ///
-    /// Losing the key makes the stored files unreadable.
+    /// The data dir must be new, or one only ever used with this key: a
+    /// data dir that already holds unencrypted records (from chorrent 0.5.0,
+    /// or used without a key) is refused rather than mixed, as is opening an
+    /// encrypted one without its key. Losing the key makes everything
+    /// stored unreadable.
     pub fn encrypted_storage(mut self, key: [u8; 32]) -> Self {
         self.storage_key = Some(key);
         self
@@ -152,12 +158,9 @@ impl ClientBuilder {
             return Err(Error::Storage("encrypted storage needs a data_dir".into()));
         }
         let store = match &self.data_dir {
-            Some(dir) => Some(Arc::new(Store::open(dir)?)),
+            Some(dir) => Some(Arc::new(Store::open(dir, self.storage_key.as_ref())?)),
             None => None,
         };
-        if let (Some(store), Some(key)) = (&store, &self.storage_key) {
-            store.check_storage_key(key)?;
-        }
         let store_cfg = self.data_dir.as_ref().map(|dir| StoreConfig {
             blobs: dir.join("blobs"),
             key: self.storage_key.map(MasterKey::new),

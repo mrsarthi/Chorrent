@@ -13,7 +13,8 @@ routers, with a relay server as a fallback).
 - **Swarms:** download from many sharers at once. Sharers find each other automatically.
 - **Resumes** interrupted downloads, and remembers shares across restarts.
 - **Private shares** and **contact allowlists**: only the people you choose can download.
-- **Encrypted storage** for apps that must not leave files readable on disk.
+- **Encrypted storage** for apps that must not leave anything readable on disk: files,
+  file names, share codes and who you shared with are all encrypted.
 - **Runs on your app's own iroh endpoint**, if you already have one.
 - Works on Windows, macOS, Linux and Android.
 

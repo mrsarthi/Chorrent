@@ -49,6 +49,11 @@ impl MasterKey {
         Self(Arc::new(key))
     }
 
+    /// A key for one purpose, derived from this one.
+    pub fn derive(&self, context: &str) -> [u8; 32] {
+        blake3::derive_key(context, &self.0[..])
+    }
+
     fn file_key(&self, salt: &[u8; 16]) -> XChaCha20Poly1305 {
         let mut material = Vec::with_capacity(48);
         material.extend_from_slice(&self.0[..]);

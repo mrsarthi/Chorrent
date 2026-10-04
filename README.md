@@ -1,4 +1,4 @@
-# Chorrent (vers. 0.5.0)
+# Chorrent (vers. 0.5.1)
 
 Chorrent sends files and folders straight from one computer to another. There's no upload
 to a website or cloud in between, and no size limit. You share a file, Chorrent gives you a
