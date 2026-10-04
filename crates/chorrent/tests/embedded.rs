@@ -46,7 +46,8 @@ async fn app_as(key: [u8; 32], data: tempfile::TempDir, download_limit: Option<u
             .endpoint(endpoint.clone())
             .data_dir(data.path())
             .encrypted_storage(key)
-            .discovery_timeout(Duration::from_secs(10))
+            // Generous: several tests share the network at once.
+            .discovery_timeout(Duration::from_secs(20))
             .download_limit(download_limit)
             .build()
             .await
@@ -56,18 +57,22 @@ async fn app_as(key: [u8; 32], data: tempfile::TempDir, download_limit: Option<u
     let accept_loop = tokio::spawn({
         let (endpoint, client) = (endpoint.clone(), Arc::clone(&client));
         async move {
+            // Connection tasks live in this set, so stopping the accept loop
+            // stops them too (each holds the client).
+            let mut connections = tokio::task::JoinSet::new();
             while let Some(incoming) = endpoint.accept().await {
                 // Finish each handshake in its own task: awaiting it here
                 // would let one slow or abandoned handshake block every
                 // connection after it.
                 let client = Arc::clone(&client);
-                tokio::spawn(async move {
+                connections.spawn(async move {
                     let Ok(connection) = incoming.await else { return };
                     // Route by ALPN before touching the connection.
                     if client.alpns().iter().any(|a| a.as_slice() == connection.alpn()) {
                         client.handle_connection(connection).await;
                     }
                 });
+                while connections.try_join_next().is_some() {}
             }
         }
     });
@@ -379,4 +384,37 @@ async fn sealed_and_plain_data_dirs_are_never_mixed() {
     tokio::time::sleep(Duration::from_millis(300)).await;
     let without_key = Client::builder().data_dir(sealed.path()).build().await;
     assert!(matches!(without_key, Err(Error::Storage(ref m)) if m.contains("encrypted")), "sealed dir, no key");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn seeding_never_waits_for_an_unreachable_relay() {
+    // A phone that can't reach any relay: its endpoint has none at all.
+    let endpoint = Endpoint::builder(presets::N0)
+        .clear_relay_transports()
+        .alpns(vec![chorrent::ALPN.to_vec()])
+        .bind()
+        .await
+        .unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let started = std::time::Instant::now();
+    let client = Client::builder()
+        .endpoint(endpoint)
+        .data_dir(data.path())
+        .encrypted_storage([7; 32])
+        .build()
+        .await
+        .unwrap();
+    assert!(client.network_status().relay.is_none());
+
+    let src = tempfile::tempdir().unwrap();
+    for n in 0..3 {
+        let file = src.path().join(format!("photo{n}.jpg"));
+        std::fs::write(&file, content(10_000 + n)).unwrap();
+        client.seed(&file).await.unwrap();
+    }
+    // Three attachments used to cost 10 s of waiting each.
+    assert!(started.elapsed() < Duration::from_secs(5), "took {:?}", started.elapsed());
+
+    // Apps can still wait on purpose, and learn the answer.
+    assert!(!client.wait_for_relay(Duration::from_millis(300)).await);
 }

@@ -55,7 +55,7 @@ Whoever has it can download the share (add allowlists if that's not enough).
 
 | | |
 |---|---|
-| `Client::builder()` | Settings: a folder to remember things in (`data_dir`), speed limits, encrypted storage, an existing iroh endpoint |
+| `Client::builder()` | Settings: a folder to remember things in (`data_dir`), speed limits, encrypted storage, an existing iroh endpoint, how long to wait for the relay at startup |
 | `client.seed(path)` / `seed_with(path, options)` | Share a file or folder. Options: `private`, `allow_peers`, `join` another sharer's swarm |
 | `client.seed_reader(name, size, reader, options)` | Share a stream instead of a path, e.g. an Android content URI |
 | `client.download(&code, dest)` / `download_with` | Download. Returns a handle with `events()`, `cancel()` and `finished()` |
@@ -81,6 +81,9 @@ let client = Arc::new(chorrent::Client::builder()
     .encrypted_storage(key_from_keychain)   // received files stay encrypted on disk
     .build().await?);
 ```
+
+In this mode chorrent never waits for the relay: your app manages the connection. Check
+`client.network_status()` before sending, so you can warn the user if it isn't connected.
 
 The full example is in the
 [repository README](https://github.com/mrsarthi/Chorrent#inside-an-app-that-already-uses-iroh).

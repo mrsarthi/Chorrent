@@ -81,11 +81,10 @@ impl ChorrentNode {
         self.endpoint.addr()
     }
 
-    /// Our address once we're reachable through a relay (or after a short
-    /// wait if that's not possible), so share codes carry a usable address.
-    pub async fn reachable_addr(&self) -> EndpointAddr {
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(10), self.endpoint.online()).await;
-        self.endpoint.addr()
+    /// Wait until we're connected to a relay, for at most `timeout`.
+    /// Returns whether we are.
+    pub async fn wait_for_relay(&self, timeout: std::time::Duration) -> bool {
+        tokio::time::timeout(timeout, self.endpoint.online()).await.is_ok()
     }
 
     pub async fn connect(&self, addr: EndpointAddr) -> Result<Connection, NodeError> {

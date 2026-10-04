@@ -34,6 +34,8 @@ pub struct ClientBuilder {
     download_limit: Option<u64>,
     discovery_timeout: Duration,
     mainline_dht: bool,
+    /// None: the default for the mode (see `ClientBuilder::wait_for_relay`).
+    relay_wait: Option<Duration>,
 }
 
 impl std::fmt::Debug for ClientBuilder {
@@ -59,6 +61,7 @@ impl Default for ClientBuilder {
             download_limit: None,
             discovery_timeout: Duration::from_secs(30),
             mainline_dht: false,
+            relay_wait: None,
         }
     }
 }
@@ -152,6 +155,18 @@ impl ClientBuilder {
         self
     }
 
+    /// How long [`ClientBuilder::build`] waits for the relay connection, so
+    /// the first share codes work from other networks. Waits only this once,
+    /// at startup; seeding never waits.
+    ///
+    /// Default: 10 seconds when chorrent creates its own endpoint, none with
+    /// [`ClientBuilder::endpoint`] (your app manages that connection; see
+    /// [`Client::wait_for_relay`] and [`Client::network_status`]).
+    pub fn wait_for_relay(mut self, timeout: Duration) -> Self {
+        self.relay_wait = Some(timeout);
+        self
+    }
+
     /// Start the client: bind (or attach to) the endpoint and open the data dir.
     pub async fn build(self) -> Result<Client> {
         if self.storage_key.is_some() && self.data_dir.is_none() {
@@ -171,6 +186,7 @@ impl ClientBuilder {
             upload_slots: Arc::new(Semaphore::new(self.max_uploads)),
             upload_rate: self.upload_limit.map(|r| Arc::new(RateLimiter::new(r))),
         };
+        let embedded = self.endpoint.is_some();
         let node = match self.endpoint {
             Some(endpoint) => ChorrentNode::attach(endpoint, handler, self.gossip.unwrap_or(false)),
             None => {
@@ -181,6 +197,12 @@ impl ClientBuilder {
                 ChorrentNode::bind(handler, key, self.gossip.unwrap_or(true), self.mainline_dht).await?
             }
         };
+        let relay_wait = self.relay_wait.unwrap_or(if embedded { Duration::ZERO } else { Duration::from_secs(10) });
+        if !relay_wait.is_zero() {
+            // If it doesn't connect in time we carry on: share codes pick up
+            // the relay when it does, and network_status() says so meanwhile.
+            node.wait_for_relay(relay_wait).await;
+        }
         Ok(Client {
             node: Arc::new(node),
             registry,
@@ -322,6 +344,14 @@ impl Client {
         self.node.id().to_string()
     }
 
+    /// Wait until this node is connected to a relay, for at most `timeout`,
+    /// and return whether it is. Share codes made before that may only work
+    /// for devices that can connect directly. Returns at once if already
+    /// connected.
+    pub async fn wait_for_relay(&self, timeout: Duration) -> bool {
+        self.node.wait_for_relay(timeout).await
+    }
+
     /// Whether we're connected to a relay, and our addresses. Without a
     /// relay, peers on other networks usually can't reach us.
     pub fn network_status(&self) -> NetworkStatus {
@@ -435,10 +465,9 @@ impl Client {
         if let Some(store) = &self.store {
             store.remember_seed(&share)?;
         }
-        // Give the relay a moment so the first share code is reachable from
-        // anywhere. If it is not connected by then, share_code() picks the
-        // relay up as soon as it is.
-        self.node.reachable_addr().await;
+        // No waiting for the relay here: that happens once, at startup (see
+        // ClientBuilder::wait_for_relay). share_code() always uses our
+        // current address, so it includes the relay as soon as it connects.
         let code = ShareCode {
             id: share.id,
             name: share.manifest.name().to_string(),

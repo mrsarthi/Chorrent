@@ -1,4 +1,4 @@
-# Chorrent (vers. 0.5.1)
+# Chorrent (vers. 0.5.2)
 
 Chorrent sends files and folders straight from one computer to another. There's no upload
 to a website or cloud in between, and no size limit. You share a file, Chorrent gives you a
@@ -327,6 +327,8 @@ let client = Arc::new(chorrent::Client::builder()
 
 // In your accept loop: finish each handshake in its own task (awaiting it
 // inline lets one stalled peer block every connection), then route by ALPN.
+// If you ever shut the client down, spawn these into a JoinSet owned by the
+// loop instead: each task holds the client, and stopping the loop then stops them.
 while let Some(incoming) = endpoint.accept().await {
     let client = client.clone();
     tokio::spawn(async move {

@@ -427,6 +427,7 @@ async fn run_doctor(opts: &GlobalOpts, codes: Vec<String>) -> Result<()> {
     // shouldn't clash with a seed or download running alongside.
     let client = Client::builder()
         .mainline_dht(opts.dht)
+        .wait_for_relay(Duration::ZERO) // the check below waits and reports instead
         .build()
         .await
         .context("failed to start")?;
