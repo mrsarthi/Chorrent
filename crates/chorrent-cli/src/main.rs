@@ -274,13 +274,16 @@ async fn run_seed(
         .await
         .with_context(|| format!("failed to share {}", path.display()))?;
     if json {
-        println!("{}", serde_json::json!({
-            "type": "seed_started",
-            "path": seed.path().display().to_string(),
-            "share_code": seed.share_code().to_string(),
-            "share_id": seed.share_code().id().to_string(),
-            "private": seed.share_code().is_private()
-        }));
+        println!(
+            "{}",
+            serde_json::json!({
+                "type": "seed_started",
+                "path": seed.path().display().to_string(),
+                "share_code": seed.share_code().to_string(),
+                "share_id": seed.share_code().id().to_string(),
+                "private": seed.share_code().is_private()
+            })
+        );
     } else {
         print_seed_info(&seed);
     }
@@ -505,7 +508,11 @@ async fn run_get(
     let (code, dest_dir) = split_get_args(args)?;
     let client = make_client(opts, reseed, false).await?;
     if !json {
-        println!("Downloading {} ({})", code.name(), HumanBytes(code.total_size()));
+        println!(
+            "Downloading {} ({})",
+            code.name(),
+            HumanBytes(code.total_size())
+        );
         if code.peer_ids().len() > 1 {
             println!("Starting from {} known seeders", code.peer_ids().len());
         }
@@ -661,15 +668,18 @@ async fn run_doctor(opts: &GlobalOpts, codes: Vec<String>, json: bool) -> Result
                 "peers": peers
             }));
         }
-        println!("{}", serde_json::json!({
-            "type": "doctor",
-            "device": {
-                "id": status.id,
-                "relay": status.relay,
-                "direct_addresses": status.direct_addresses
-            },
-            "shares": shares
-        }));
+        println!(
+            "{}",
+            serde_json::json!({
+                "type": "doctor",
+                "device": {
+                    "id": status.id,
+                    "relay": status.relay,
+                    "direct_addresses": status.direct_addresses
+                },
+                "shares": shares
+            })
+        );
         client.shutdown().await;
         return Ok(());
     }
