@@ -25,6 +25,9 @@ struct Cli {
 
 #[derive(Args)]
 struct GlobalOpts {
+    /// Emit newline-delimited JSON for seed and get, or JSON arrays/objects for list and doctor
+    #[arg(long, global = true)]
+    json: bool,
     /// Where to keep identity, seeds and download progress
     /// [default: the platform's app data folder]
     #[arg(long, global = true, env = "CHORRENT_DATA_DIR")]
@@ -167,19 +170,19 @@ async fn main() -> Result<()> {
             path,
             private,
             join,
-        } => run_seed(&cli.opts, path, private, join).await,
+        } => run_seed(&cli.opts, path, private, join, cli.opts.json).await,
         Command::Get {
             args,
             seed,
             no_reseed,
-        } => run_get(&cli.opts, args, seed, !no_reseed).await,
-        Command::Doctor { codes } => run_doctor(&cli.opts, codes).await,
+        } => run_get(&cli.opts, args, seed, !no_reseed, cli.opts.json).await,
+        Command::Doctor { codes } => run_doctor(&cli.opts, codes, cli.opts.json).await,
         Command::Completions { shell } => {
             let mut cmd = Cli::command();
             generate(shell, &mut cmd, "chorrent", &mut std::io::stdout());
             Ok(())
         }
-        Command::List => run_list(&cli.opts).await,
+        Command::List => run_list(&cli.opts, cli.opts.json).await,
         Command::Resume => run_resume(&cli.opts).await,
         Command::Forget { share_id } => {
             let client = make_client(&cli.opts, true, true).await?;
@@ -256,26 +259,49 @@ async fn run_seed(
     path: PathBuf,
     private: bool,
     join: Option<String>,
+    json: bool,
 ) -> Result<()> {
     let mut options = SeedOptions::default().private(private);
     if let Some(code) = join {
         options = options.join(code.parse().context("the --join share code isn't valid")?);
     }
     let client = make_client(opts, true, false).await?;
-    println!("Hashing {}...", path.display());
+    if !json {
+        println!("Hashing {}...", path.display());
+    }
     let seed = client
         .seed_with(&path, options)
         .await
         .with_context(|| format!("failed to share {}", path.display()))?;
-    print_seed_info(&seed);
+    if json {
+        println!("{}", serde_json::json!({
+            "type": "seed_started",
+            "path": seed.path().display().to_string(),
+            "share_code": seed.share_code().to_string(),
+            "share_id": seed.share_code().id().to_string(),
+            "private": seed.share_code().is_private()
+        }));
+    } else {
+        print_seed_info(&seed);
+    }
     let mut relay = client.network_status().relay;
-    if relay.is_none() {
+    if relay.is_none() && !json {
         println!("{NO_RELAY_WARNING}\n");
     }
-    println!("Seeding. Press Ctrl+C to stop.");
-
-    let spinner = ProgressBar::new_spinner();
-    let watcher = tokio::spawn(watch_seed(seed.events(), spinner.clone(), String::new()));
+    if !json {
+        println!("Seeding. Press Ctrl+C to stop.");
+    }
+    let spinner = if json {
+        ProgressBar::hidden()
+    } else {
+        ProgressBar::new_spinner()
+    };
+    let watcher = tokio::spawn(watch_seed(
+        seed.events(),
+        spinner.clone(),
+        String::new(),
+        json,
+    ));
     let ctrl_c = tokio::signal::ctrl_c();
     tokio::pin!(ctrl_c);
     let mut check = tokio::time::interval(Duration::from_secs(2));
@@ -285,13 +311,21 @@ async fn run_seed(
             _ = check.tick() => {
                 let now = client.network_status().relay;
                 if now != relay {
-                    match &now {
-                        Some(url) => say(&spinner, format!(
-                            "Connected to relay server {url}: reachable from any network now.\n\
-                             Share this updated code (the earlier one may not work from other networks):\n{}\n",
-                            seed.share_code()
-                        )),
-                        None => say(&spinner, format!("{NO_RELAY_WARNING}\n")),
+                    if json {
+                        println!("{}", serde_json::json!({
+                            "type": "relay_status",
+                            "connected": now.is_some(),
+                            "url": now.as_ref().map(ToString::to_string)
+                        }));
+                    } else {
+                        match &now {
+                            Some(url) => say(&spinner, format!(
+                                "Connected to relay server {url}: reachable from any network now.\n\
+                                 Share this updated code (the earlier one may not work from other networks):\n{}\n",
+                                seed.share_code()
+                            )),
+                            None => say(&spinner, format!("{NO_RELAY_WARNING}\n")),
+                        }
                     }
                     relay = now;
                 }
@@ -304,10 +338,18 @@ async fn run_seed(
     Ok(())
 }
 
+fn print_json_event(event: &Event) {
+    println!(
+        "{}",
+        serde_json::to_string(event).expect("serializing an Event cannot fail")
+    );
+}
+
 async fn watch_seed(
     mut events: tokio::sync::broadcast::Receiver<Event>,
     spinner: ProgressBar,
     prefix: String,
+    json: bool,
 ) {
     spinner.set_style(spinner_style());
     spinner.set_prefix(prefix);
@@ -316,11 +358,12 @@ async fn watch_seed(
     let (mut total, mut this_second) = (0u64, 0u64);
     loop {
         tokio::select! {
-            _ = ticker.tick() => {
+            _ = ticker.tick(), if !json => {
                 spinner.set_message(format!("uploaded {} ({}/s)", HumanBytes(total), HumanBytes(this_second)));
                 this_second = 0;
             }
             event = events.recv() => match event {
+                Ok(event) if json => print_json_event(&event),
                 Ok(Event::Uploaded { bytes }) => { total += bytes; this_second += bytes; }
                 Ok(Event::SwarmPeers { connected }) if connected > 0 => say(&spinner, swarm_line(connected)),
                 Ok(Event::SharedFileChanged { path }) => say(&spinner, format!(
@@ -337,6 +380,7 @@ async fn watch_seed(
 async fn drive_download(
     download: DownloadHandle,
     pb: ProgressBar,
+    json: bool,
 ) -> chorrent::Result<chorrent::Finished> {
     pb.set_style(bar_style());
     pb.set_length(download.share_code().total_size());
@@ -347,6 +391,16 @@ async fn drive_download(
     let progress = tokio::spawn({
         let pb = pb.clone();
         async move {
+            if json {
+                loop {
+                    match events.recv().await {
+                        Ok(event) => print_json_event(&event),
+                        Err(RecvError::Lagged(_)) => continue,
+                        Err(RecvError::Closed) => break,
+                    }
+                }
+                return;
+            }
             let mut peers = 0usize;
             loop {
                 match events.recv().await {
@@ -446,24 +500,27 @@ async fn run_get(
     args: Vec<String>,
     keep_seeding: bool,
     reseed: bool,
+    json: bool,
 ) -> Result<()> {
     let (code, dest_dir) = split_get_args(args)?;
     let client = make_client(opts, reseed, false).await?;
-    println!(
-        "Downloading {} ({})",
-        code.name(),
-        HumanBytes(code.total_size())
-    );
-    if code.peer_ids().len() > 1 {
-        println!("Starting from {} known seeders", code.peer_ids().len());
+    if !json {
+        println!("Downloading {} ({})", code.name(), HumanBytes(code.total_size()));
+        if code.peer_ids().len() > 1 {
+            println!("Starting from {} known seeders", code.peer_ids().len());
+        }
     }
     let download = client
         .download(&code, dest_dir)
         .await
         .context("failed to start the download")?;
 
-    let pb = ProgressBar::new(code.total_size());
-    let driver = tokio::spawn(drive_download(download, pb.clone()));
+    let pb = if json {
+        ProgressBar::hidden()
+    } else {
+        ProgressBar::new(code.total_size())
+    };
+    let driver = tokio::spawn(drive_download(download, pb.clone(), json));
     let abort = driver.abort_handle();
     let mut driver = driver;
     let ctrl_c = tokio::signal::ctrl_c();
@@ -480,13 +537,22 @@ async fn run_get(
                 abort.abort();
                 tokio::time::sleep(Duration::from_millis(300)).await;
                 client.shutdown().await;
-                println!("\nStopped. Run `chorrent resume` (or the same `get`) to continue.");
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::json!({"type":"download_stopped","resumable":true})
+                    );
+                } else {
+                    println!("\nStopped. Run `chorrent resume` (or the same `get`) to continue.");
+                }
                 return Ok(());
             }
             _ = &mut relay_check, if !relay_checked => {
                 relay_checked = true;
                 if client.network_status().relay.is_none() {
-                    say(&pb, format!("{NO_RELAY_WARNING}\n"));
+                    if !json {
+                        say(&pb, format!("{NO_RELAY_WARNING}\n"));
+                    }
                 }
             }
         }
@@ -501,19 +567,44 @@ async fn run_get(
     };
     // The CLI never uses an encrypted store, so there's always a path.
     if let Some(path) = &finished.path {
-        println!("Saved to {}", path.display());
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "type": "download_saved",
+                    "path": path.display().to_string()
+                })
+            );
+        } else {
+            println!("Saved to {}", path.display());
+        }
     }
 
     if keep_seeding && let Some(seed) = finished.seed {
-        println!(
-            "\nSeeding it too. Share this code:\n{}\n",
-            seed.share_code()
-        );
-        println!("Press Ctrl+C to stop.");
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "type": "seeding_started",
+                    "share_code": seed.share_code().to_string()
+                })
+            );
+        } else {
+            println!(
+                "\nSeeding it too. Share this code:\n{}\n",
+                seed.share_code()
+            );
+            println!("Press Ctrl+C to stop.");
+        }
         let watcher = tokio::spawn(watch_seed(
             seed.events(),
-            ProgressBar::new_spinner(),
+            if json {
+                ProgressBar::hidden()
+            } else {
+                ProgressBar::new_spinner()
+            },
             String::new(),
+            json,
         ));
         tokio::signal::ctrl_c().await?;
         watcher.abort();
@@ -522,7 +613,7 @@ async fn run_get(
     Ok(())
 }
 
-async fn run_doctor(opts: &GlobalOpts, codes: Vec<String>) -> Result<()> {
+async fn run_doctor(opts: &GlobalOpts, codes: Vec<String>, json: bool) -> Result<()> {
     let codes = codes
         .iter()
         .map(|c| {
@@ -539,6 +630,49 @@ async fn run_doctor(opts: &GlobalOpts, codes: Vec<String>) -> Result<()> {
         .await
         .context("failed to start")?;
 
+    if json {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        let mut status = client.network_status();
+        while status.relay.is_none() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            status = client.network_status();
+        }
+        let mut shares = Vec::new();
+        for code in &codes {
+            let peers = client
+                .check_peers(code)
+                .await
+                .into_iter()
+                .map(|check| {
+                    serde_json::json!({
+                        "peer": check.peer,
+                        "reachable": check.reachable,
+                        "problem": check.problem,
+                        "listed_relay": check.listed_relay,
+                        "direct": check.direct,
+                        "rtt_ms": check.rtt_ms,
+                        "serves_share": check.serves_share
+                    })
+                })
+                .collect::<Vec<_>>();
+            shares.push(serde_json::json!({
+                "name": code.name(),
+                "peer_count": code.peer_ids().len(),
+                "peers": peers
+            }));
+        }
+        println!("{}", serde_json::json!({
+            "type": "doctor",
+            "device": {
+                "id": status.id,
+                "relay": status.relay,
+                "direct_addresses": status.direct_addresses
+            },
+            "shares": shares
+        }));
+        client.shutdown().await;
+        return Ok(());
+    }
     println!("This device");
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     let mut status = client.network_status();
@@ -607,9 +741,33 @@ async fn run_doctor(opts: &GlobalOpts, codes: Vec<String>) -> Result<()> {
     Ok(())
 }
 
-async fn run_list(opts: &GlobalOpts) -> Result<()> {
+async fn run_list(opts: &GlobalOpts, json: bool) -> Result<()> {
     let client = make_client(opts, true, true).await?;
     let saved = client.saved()?;
+    if json {
+        let items = saved
+            .iter()
+            .filter_map(|item| match item {
+                SavedTransfer::Seed { id, path, private } => Some(serde_json::json!({
+                    "type": "seed",
+                    "share_id": id.to_string(),
+                    "path": path.display().to_string(),
+                    "private": private
+                })),
+                SavedTransfer::Download { code, dest_dir } => Some(serde_json::json!({
+                    "type": "download",
+                    "share_id": code.id().to_string(),
+                    "name": code.name(),
+                    "share_code": code.to_string(),
+                    "destination": dest_dir.display().to_string()
+                })),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        println!("{}", serde_json::to_string(&items)?);
+        client.shutdown().await;
+        return Ok(());
+    }
     if saved.is_empty() {
         println!("Nothing saved.");
     }
@@ -659,6 +817,7 @@ async fn run_resume(opts: &GlobalOpts) -> Result<()> {
                     seed.events(),
                     multi.add(ProgressBar::new_spinner()),
                     name,
+                    false,
                 ));
                 seeds.push(seed);
             }
@@ -666,11 +825,11 @@ async fn run_resume(opts: &GlobalOpts) -> Result<()> {
                 let pb = multi.add(ProgressBar::new(0));
                 pb.set_prefix(download.share_code().name().to_string());
                 tasks.spawn(async move {
-                    match drive_download(download, pb.clone()).await {
+                    match drive_download(download, pb.clone(), false).await {
                         // Keep it seeding for as long as `resume` runs.
                         Ok(finished) => {
                             if let Some(seed) = finished.seed {
-                                watch_seed(seed.events(), pb, String::new()).await;
+                                watch_seed(seed.events(), pb, String::new(), false).await;
                             }
                         }
                         Err(e) => say(&pb, format!("Download failed: {e}")),

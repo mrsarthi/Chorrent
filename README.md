@@ -33,6 +33,7 @@ Chorrent is two things:
   - [get: download](#get-download)
   - [doctor: check your connection](#doctor-check-your-connection)
   - [list, resume, forget: saved transfers](#list-resume-forget-saved-transfers)
+  - [JSON output for scripts and GUIs](#json-output-for-scripts-and-guis)
   - [Options that work with every command](#options-that-work-with-every-command)
   - [Shell completions](#shell-completions)
 - [Common situations](#common-situations)
@@ -221,6 +222,27 @@ chorrent forget <share-id>    # remove one from the list
 - **`forget`** only removes an item from the list. It **never deletes your files**.
 
 ---
+
+### JSON output for scripts and GUIs
+
+The global `--json` flag is supported by `seed`, `get`, `list`, and `doctor`.
+
+- `seed` and `get` emit newline-delimited JSON. Transfer events use the existing
+  `chorrent::Event` schema, tagged with `type`. Lifecycle records use
+  `seed_started`, `relay_status`, `download_stopped`, `download_saved`, and `seeding_started`.
+- `list --json` emits a JSON array of saved seed and download entries.
+- `doctor --json` emits one object with `type: "doctor"`, a `device` object
+  containing the device ID, relay URL (or `null`) and direct addresses, and a `shares`
+  array containing per-peer reachability and connection diagnostics.
+
+Examples:
+
+```bash
+chorrent --json seed ./folder
+chorrent get <share-code> --json
+chorrent list --json
+chorrent doctor <share-code> --json
+```
 
 ### Options that work with every command
 
