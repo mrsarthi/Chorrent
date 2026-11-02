@@ -486,8 +486,15 @@ async fn drive_download(
         .await
         .expect("download progress task should return its event receiver");
     if json {
-        while let Ok(event) = events.try_recv() {
-            print_json_event(&event);
+        loop {
+            match events.try_recv() {
+                Ok(event) => print_json_event(&event),
+                Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => continue,
+                Err(
+                    tokio::sync::broadcast::error::TryRecvError::Empty
+                    | tokio::sync::broadcast::error::TryRecvError::Closed,
+                ) => break,
+            }
         }
     }
     match &result {
