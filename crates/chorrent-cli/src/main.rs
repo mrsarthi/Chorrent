@@ -671,11 +671,7 @@ async fn run_doctor(opts: &GlobalOpts, codes: Vec<String>, json: bool) -> Result
         }
         let mut shares = Vec::new();
         for code in &codes {
-            let peers = client
-                .check_peers(code)
-                .await
-                .into_iter()
-                .collect::<Vec<_>>();
+            let peers = client.check_peers(code).await;
             shares.push(serde_json::json!({
                 "name": code.name(),
                 "peer_count": code.peer_ids().len(),
