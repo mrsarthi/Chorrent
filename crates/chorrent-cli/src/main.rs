@@ -273,11 +273,13 @@ async fn run_seed(
         .seed_with(&path, options)
         .await
         .with_context(|| format!("failed to share {}", path.display()))?;
+    let mut relay = client.network_status().relay;
     if json {
         println!(
             "{}",
             serde_json::json!({
                 "type": "seed_started",
+                "relay": relay.clone(),
                 "path": seed.path().display().to_string(),
                 "share_code": seed.share_code().to_string(),
                 "share_id": seed.share_code().id().to_string(),
@@ -287,7 +289,6 @@ async fn run_seed(
     } else {
         print_seed_info(&seed);
     }
-    let mut relay = client.network_status().relay;
     if relay.is_none() && !json {
         println!("{NO_RELAY_WARNING}\n");
     }
@@ -318,7 +319,8 @@ async fn run_seed(
                         println!("{}", serde_json::json!({
                             "type": "relay_status",
                             "connected": now.is_some(),
-                            "url": now.as_ref().map(ToString::to_string)
+                            "url": now.as_ref().map(ToString::to_string),
+                            "share_code": seed.share_code().to_string()
                         }));
                     } else {
                         match &now {
@@ -391,22 +393,31 @@ async fn drive_download(
     pb.enable_steady_tick(Duration::from_millis(200));
 
     let mut events = download.events();
+    let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel();
     let progress = tokio::spawn({
         let pb = pb.clone();
         async move {
             if json {
                 loop {
-                    match events.recv().await {
+                    let event = tokio::select! {
+                        _ = &mut stop_rx => break,
+                        event = events.recv() => event,
+                    };
+                    match event {
                         Ok(event) => print_json_event(&event),
                         Err(RecvError::Lagged(_)) => continue,
                         Err(RecvError::Closed) => break,
                     }
                 }
-                return;
+                return events;
             }
             let mut peers = 0usize;
             loop {
-                match events.recv().await {
+                let event = tokio::select! {
+                    _ = &mut stop_rx => break,
+                    event = events.recv() => event,
+                };
+                match event {
                     Ok(Event::ManifestReceived { files, .. }) => {
                         pb.set_message(format!("{files} file(s)"));
                     }
@@ -466,10 +477,19 @@ async fn drive_download(
                     Err(RecvError::Closed) => break,
                 }
             }
+            events
         }
     });
     let result = download.finished().await;
-    progress.abort();
+    let _ = stop_tx.send(());
+    let mut events = progress
+        .await
+        .expect("download progress task should return its event receiver");
+    if json {
+        while let Ok(event) = events.try_recv() {
+            print_json_event(&event);
+        }
+    }
     match &result {
         Ok(_) => pb.finish_with_message("done, verified"),
         Err(_) => pb.abandon(),
@@ -556,10 +576,8 @@ async fn run_get(
             }
             _ = &mut relay_check, if !relay_checked => {
                 relay_checked = true;
-                if client.network_status().relay.is_none() {
-                    if !json {
-                        say(&pb, format!("{NO_RELAY_WARNING}\n"));
-                    }
+                if client.network_status().relay.is_none() && !json {
+                    say(&pb, format!("{NO_RELAY_WARNING}\n"));
                 }
             }
         }
@@ -650,17 +668,6 @@ async fn run_doctor(opts: &GlobalOpts, codes: Vec<String>, json: bool) -> Result
                 .check_peers(code)
                 .await
                 .into_iter()
-                .map(|check| {
-                    serde_json::json!({
-                        "peer": check.peer,
-                        "reachable": check.reachable,
-                        "problem": check.problem,
-                        "listed_relay": check.listed_relay,
-                        "direct": check.direct,
-                        "rtt_ms": check.rtt_ms,
-                        "serves_share": check.serves_share
-                    })
-                })
                 .collect::<Vec<_>>();
             shares.push(serde_json::json!({
                 "name": code.name(),
@@ -672,11 +679,7 @@ async fn run_doctor(opts: &GlobalOpts, codes: Vec<String>, json: bool) -> Result
             "{}",
             serde_json::json!({
                 "type": "doctor",
-                "device": {
-                    "id": status.id,
-                    "relay": status.relay,
-                    "direct_addresses": status.direct_addresses
-                },
+                "device": status,
                 "shares": shares
             })
         );
@@ -768,7 +771,6 @@ async fn run_list(opts: &GlobalOpts, json: bool) -> Result<()> {
                     "type": "download",
                     "share_id": code.id().to_string(),
                     "name": code.name(),
-                    "share_code": code.to_string(),
                     "destination": dest_dir.display().to_string()
                 })),
                 _ => None,
